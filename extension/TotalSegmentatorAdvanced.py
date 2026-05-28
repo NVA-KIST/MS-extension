@@ -237,7 +237,7 @@ class TotalSegmentatorAdvanced(ScriptedLoadableModule):
         parent.title       = "TotalSegmentator Advanced"
         parent.categories  = ["Segmentation"]
         parent.dependencies = []
-        parent.contributors = ["Research Lab"]
+        parent.contributors = ["Ishita Singh Faujdar"]
         parent.helpText = (
             "Run TotalSegmentator with full control over which task and which "
             "individual structures to segment. Requires the totalsegmentator "
@@ -480,16 +480,28 @@ class TotalSegmentatorAdvancedWidget(ScriptedLoadableModuleWidget):
         )
         self.runBtn.setEnabled(False)
         self.progressBar.setVisible(True)
+
+        # Warn immediately if GPU was requested but may not be available
+        if gpu:
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    self.statusLabel.setText(
+                        "GPU requested but CUDA not available in Slicer's PyTorch "
+                        "— running on CPU. See Python console for upgrade instructions."
+                    )
+            except ImportError:
+                pass
         slicer.app.processEvents()
 
         try:
             seg_node = self.logic.run(
-                vol_node   = vol_node,
-                task       = task,
-                roi_subset = roi_subset,
-                fast       = fast,
-                use_gpu    = gpu,
-                multilabel = multilabel,
+                vol_node    = vol_node,
+                task        = task,
+                roi_subset  = roi_subset,
+                fast        = fast,
+                use_gpu     = gpu,
+                multilabel  = multilabel,
                 output_name = out_name,
             )
             self.statusLabel.setText(
@@ -515,43 +527,61 @@ class TotalSegmentatorAdvancedLogic(ScriptedLoadableModuleLogic):
         Export vol_node to a temp NIfTI, run totalsegmentator, load result.
         Returns the output vtkMRMLSegmentationNode.
         """
-        import tempfile, shutil
+        import tempfile
 
-        # ── verify package ─────────────────────────────────────────────────
+        # ── 1. Fix pydicom version conflict ────────────────────────────────
+        self._patch_pydicom_compat()
+
+        # ── 2. Resolve device (checks actual CUDA availability) ────────────
+        device = self._resolve_device(use_gpu)
+
+        # ── 3. Import API (after patches so imports are clean) ─────────────
         try:
             import totalsegmentator.python_api as ts_api
         except ImportError:
             raise RuntimeError(
                 "totalsegmentator is not installed.\n"
                 "Open the Python console and run:\n"
-                "  import pip; pip.main(['install', 'totalsegmentator'])"
+                "  import subprocess, sys\n"
+                "  subprocess.check_call([sys.executable, '-m', 'pip', "
+                "'install', 'totalsegmentator'])"
             )
 
         with tempfile.TemporaryDirectory(prefix="tsadv_") as tmp:
-            input_path  = os.path.join(tmp, "input.nii.gz")
-            output_dir  = os.path.join(tmp, "output")
+            input_path = os.path.join(tmp, "input.nii.gz")
+            output_dir = os.path.join(tmp, "output")
             os.makedirs(output_dir, exist_ok=True)
 
             # ── export input ───────────────────────────────────────────────
             print(f"[TSAdv] Exporting input to {input_path} …")
             slicer.util.saveNode(vol_node, input_path)
 
-            # ── run totalsegmentator ───────────────────────────────────────
-            device = "gpu" if use_gpu else "cpu"
+            # ── build kwargs, adapting to installed API version ────────────
+            import inspect
+            ts_params = set(inspect.signature(ts_api.totalsegmentator).parameters)
+
             print(f"[TSAdv] task={task}  fast={fast}  device={device}  "
                   f"roi_subset={roi_subset}  multilabel={multilabel}")
             slicer.app.processEvents()
 
             kwargs = dict(
-                input   = input_path,
-                output  = output_dir,
-                task    = task,
-                fast    = fast,
-                device  = device,
-                multilabel = multilabel,
+                input  = input_path,
+                output = output_dir,
+                task   = task,
+                fast   = fast,
+                device = device,
             )
             if roi_subset:
                 kwargs["roi_subset"] = roi_subset
+
+            # Multilabel flag name varies: 'ml' in v2+, 'multilabel' in v1
+            if multilabel:
+                if "ml" in ts_params:
+                    kwargs["ml"] = True
+                elif "multilabel" in ts_params:
+                    kwargs["multilabel"] = True
+                else:
+                    print("[TSAdv] WARNING: multilabel not supported — ignored")
 
             ts_api.totalsegmentator(**kwargs)
             slicer.app.processEvents()
@@ -560,6 +590,86 @@ class TotalSegmentatorAdvancedLogic(ScriptedLoadableModuleLogic):
             seg_node = self._load_output(output_dir, multilabel, output_name)
             print(f"[TSAdv] Done — '{seg_node.GetName()}' in scene.")
             return seg_node
+
+    # ── Dependency / device helpers ───────────────────────────────────────────
+
+    def _patch_pydicom_compat(self):
+        """
+        TotalSegmentator's import chain goes:
+          nnunet.py → dicom_io.py → dicom2nifti → pydicom.pixels
+        pydicom.pixels.decoders requires pydicom >= 2.4.0 (adds get_frame).
+        Slicer ships an older pydicom → upgrade it in-place before importing.
+        """
+        import sys, subprocess
+
+        # Quick probe: if get_frame already exists, nothing to do
+        try:
+            from pydicom.encaps import get_frame  # noqa
+            return
+        except (ImportError, AttributeError):
+            pass
+
+        import pydicom
+        print(f"[TSAdv] pydicom {pydicom.__version__} is incompatible with "
+              f"dicom2nifti — upgrading…")
+        try:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", "--quiet",
+                "--upgrade", "pydicom", "dicom2nifti"
+            ])
+        except Exception as e:
+            raise RuntimeError(
+                f"Auto-upgrade of pydicom failed: {e}\n\n"
+                "Please fix manually in Slicer's Python console:\n"
+                "  import subprocess, sys\n"
+                "  subprocess.check_call([sys.executable, '-m', 'pip',\n"
+                "    'install', '--upgrade', 'pydicom', 'dicom2nifti'])\n"
+                "Then restart Slicer."
+            )
+
+        # Flush cached modules so re-imports pick up the new versions
+        stale = [k for k in sys.modules
+                 if k.startswith(("pydicom", "dicom2nifti",
+                                  "totalsegmentator", "nnunet"))]
+        for k in stale:
+            del sys.modules[k]
+        print("[TSAdv] pydicom upgraded and module cache cleared.")
+
+    def _resolve_device(self, use_gpu):
+        """
+        Return 'gpu' only when PyTorch actually sees a CUDA device.
+        If GPU was requested but is unavailable, print installation hint and
+        fall back to CPU.
+        """
+        if not use_gpu:
+            return "cpu"
+        try:
+            import torch
+            if torch.cuda.is_available():
+                name = torch.cuda.get_device_name(0)
+                print(f"[TSAdv] GPU: {name}")
+                return "gpu"
+            else:
+                print(
+                    "[TSAdv] WARNING: GPU requested but torch.cuda.is_available() "
+                    "= False.\n"
+                    "[TSAdv] Slicer ships with a CPU-only PyTorch build. "
+                    "To enable your GPU:\n"
+                    "[TSAdv]   1. Open Slicer's Python console\n"
+                    "[TSAdv]   2. Run:\n"
+                    "[TSAdv]      import subprocess, sys\n"
+                    "[TSAdv]      subprocess.check_call([\n"
+                    "[TSAdv]        sys.executable, '-m', 'pip', 'install',\n"
+                    "[TSAdv]        'torch', 'torchvision', 'torchaudio',\n"
+                    "[TSAdv]        '--index-url',\n"
+                    "[TSAdv]        'https://download.pytorch.org/whl/cu121'])\n"
+                    "[TSAdv]   3. Restart Slicer\n"
+                    "[TSAdv] Falling back to CPU for this run."
+                )
+                return "cpu"
+        except ImportError:
+            print("[TSAdv] torch not importable — using CPU")
+            return "cpu"
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

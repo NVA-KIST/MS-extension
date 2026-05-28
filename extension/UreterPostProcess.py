@@ -89,6 +89,33 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
         self.dilateSpin.setValue(13.0)
         form.addRow("Dilation radius (mm):", self.dilateSpin)
 
+        self.connectUreterCheck = qt.QCheckBox("Connect ureter path (link fragments)")
+        self.connectUreterCheck.setChecked(True)
+        self.connectUreterCheck.setToolTip(
+            "After dilation, draw a vertical tube between adjacent disconnected "
+            "ureter fragments sorted by Z position."
+        )
+        form.addRow("", self.connectUreterCheck)
+
+        self.maxGapSpin = qt.QDoubleSpinBox()
+        self.maxGapSpin.setRange(10.0, 300.0)
+        self.maxGapSpin.setSingleStep(10.0)
+        self.maxGapSpin.setValue(150.0)
+        self.maxGapSpin.setSuffix(" mm")
+        self.maxGapSpin.setToolTip(
+            "Maximum Z gap between fragment borders to bridge. "
+            "Pairs farther apart than this are left disconnected."
+        )
+        form.addRow("Max connection gap:", self.maxGapSpin)
+
+        self.fillHolesCheck = qt.QCheckBox("Fill holes (per-slice)")
+        self.fillHolesCheck.setChecked(True)
+        self.fillHolesCheck.setToolTip(
+            "After connecting fragments, fill enclosed holes inside the ureter mask "
+            "on each axial slice using binary_fill_holes."
+        )
+        form.addRow("", self.fillHolesCheck)
+
         # ── Mode radio buttons ────────────────────────────────────────────────
         modeGroup = qt.QGroupBox("Mode")
         modeRow   = qt.QHBoxLayout(modeGroup)
@@ -151,6 +178,33 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
         addSceneOrganBtn = qt.QPushButton("+ Add organ from scene")
         addSceneOrganBtn.clicked.connect(lambda: self._add_scene_organ_row())
         sceneLayout.addWidget(addSceneOrganBtn)
+
+        # ── Extra exclusion masks ─────────────────────────────────────────
+        sceneLayout.addWidget(qt.QLabel(
+            "Extra exclusion masks (dilate, then remove overlapping voxels above SUV threshold):"))
+
+        exclHdr = qt.QHBoxLayout()
+        eh1 = qt.QLabel("Segmentation"); eh1.setStyleSheet("font-weight:bold;")
+        eh2 = qt.QLabel("Sub-segment");  eh2.setStyleSheet("font-weight:bold;")
+        eh3 = qt.QLabel("Dilation (mm)"); eh3.setStyleSheet("font-weight:bold;")
+        eh4 = qt.QLabel("SUV threshold"); eh4.setStyleSheet("font-weight:bold;")
+        exclHdr.addWidget(eh1, 3)
+        exclHdr.addWidget(eh2, 2)
+        exclHdr.addWidget(eh3, 2)
+        exclHdr.addWidget(eh4, 2)
+        exclHdr.addSpacing(30)
+        sceneLayout.addLayout(exclHdr)
+
+        self._exclRows = []
+        self._exclContainer = qt.QWidget()
+        self._exclContainerLayout = qt.QVBoxLayout(self._exclContainer)
+        self._exclContainerLayout.setContentsMargins(0, 0, 0, 0)
+        self._exclContainerLayout.setSpacing(3)
+        sceneLayout.addWidget(self._exclContainer)
+
+        addExclBtn = qt.QPushButton("+ Add exclusion mask")
+        addExclBtn.clicked.connect(lambda: self._add_excl_row())
+        sceneLayout.addWidget(addExclBtn)
 
         self.layout.addWidget(self.scenePanel)
 
@@ -460,6 +514,98 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
                 configs.append((node.GetName(), mode))
         return configs
 
+    # ── Scene: exclusion mask rows ────────────────────────────────────────────
+
+    def _add_excl_row(self, dilate_mm=5.0, suv_thresh=2.0):
+        frame = qt.QFrame()
+        frame.setFrameShape(qt.QFrame.StyledPanel)
+        outer = qt.QVBoxLayout(frame)
+        outer.setContentsMargins(4, 2, 4, 2)
+        outer.setSpacing(2)
+
+        line1 = qt.QHBoxLayout()
+        seg_combo = slicer.qMRMLNodeComboBox()
+        seg_combo.nodeTypes = ['vtkMRMLSegmentationNode']
+        seg_combo.addEnabled = False
+        seg_combo.removeEnabled = False
+        seg_combo.noneEnabled = True
+        seg_combo.setMRMLScene(slicer.mrmlScene)
+        seg_combo.setToolTip("Segmentation node to use as exclusion mask")
+
+        seg_name_combo = qt.QComboBox()
+        seg_name_combo.addItem("All segments")
+        seg_name_combo.setToolTip(
+            "Choose a specific sub-segment or 'All segments' to merge all")
+        line1.addWidget(seg_combo, 3)
+        line1.addWidget(seg_name_combo, 2)
+        outer.addLayout(line1)
+
+        line2 = qt.QHBoxLayout()
+        dil_spin = qt.QDoubleSpinBox()
+        dil_spin.setRange(0.0, 50.0)
+        dil_spin.setSingleStep(1.0)
+        dil_spin.setValue(dilate_mm)
+        dil_spin.setSuffix(" mm")
+
+        suv_spin = qt.QDoubleSpinBox()
+        suv_spin.setRange(0.1, 20.0)
+        suv_spin.setSingleStep(0.5)
+        suv_spin.setDecimals(1)
+        suv_spin.setValue(suv_thresh)
+
+        rm_btn = qt.QPushButton("×")
+        rm_btn.setFixedWidth(28)
+        rm_btn.setStyleSheet("QPushButton{color:red;font-weight:bold;}")
+        rm_btn.clicked.connect(lambda: self._remove_excl_row(frame))
+
+        line2.addWidget(qt.QLabel("Dilation:"))
+        line2.addWidget(dil_spin)
+        line2.addSpacing(8)
+        line2.addWidget(qt.QLabel("SUV >"))
+        line2.addWidget(suv_spin)
+        line2.addStretch(1)
+        line2.addWidget(rm_btn)
+        outer.addLayout(line2)
+
+        row_dict = {
+            'widget': frame, 'seg': seg_combo, 'seg_name': seg_name_combo,
+            'dilate': dil_spin, 'suv': suv_spin,
+        }
+        seg_combo.currentNodeChanged.connect(
+            lambda node, r=row_dict: self._refresh_excl_seg_names(node, r))
+        self._exclContainerLayout.addWidget(frame)
+        self._exclRows.append(row_dict)
+
+    def _refresh_excl_seg_names(self, seg_node, row_dict):
+        combo = row_dict['seg_name']
+        combo.clear()
+        combo.addItem("All segments")
+        if seg_node is None:
+            return
+        seg = seg_node.GetSegmentation()
+        for i in range(seg.GetNumberOfSegments()):
+            combo.addItem(seg.GetNthSegment(i).GetName())
+
+    def _remove_excl_row(self, frame):
+        self._exclRows = [r for r in self._exclRows if r['widget'] is not frame]
+        frame.setParent(None)
+
+    def _get_excl_configs(self):
+        configs = []
+        for r in self._exclRows:
+            seg_node = r['seg'].currentNode()
+            if seg_node is None:
+                continue
+            seg_name_text = r['seg_name'].currentText
+            seg_name = None if seg_name_text == "All segments" else seg_name_text
+            configs.append({
+                'seg_node':   seg_node,
+                'seg_name':   seg_name,
+                'dilate_mm':  r['dilate'].value,
+                'suv_thresh': r['suv'].value,
+            })
+        return configs
+
     # ── Bulk: vertebrae segment picker (Slicer tab) ───────────────────────────
 
     def onParentSegChanged(self):
@@ -701,15 +847,21 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
         self.statusLabel.setText("Status: running on scene…")
         slicer.app.processEvents()
 
+        excl_configs = self._get_excl_configs()
+
         try:
             self.logic.run_scene(
                 suv_thresh          = self.suvThreshSpin.value,
                 suv_clean_thresh    = self.suvCleanSpin.value,
                 dilate_mm           = self.dilateSpin.value,
+                connect_path        = self.connectUreterCheck.isChecked(),
+                max_gap_mm          = self.maxGapSpin.value,
+                fill_holes          = self.fillHolesCheck.isChecked(),
                 pet_node            = pet_node,
                 totalseg_node_name  = ts_node.GetName(),
                 vertebrae_seg_names = vert_segs,
                 organ_configs       = organ_configs,
+                excl_configs        = excl_configs,
             )
             self.statusLabel.setText("Status: done — check Segmentations module.")
         except Exception:
@@ -766,6 +918,9 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
                 suv_thresh          = self.suvThreshSpin.value,
                 suv_clean_thresh    = self.suvCleanSpin.value,
                 dilate_mm           = self.dilateSpin.value,
+                connect_path        = self.connectUreterCheck.isChecked(),
+                max_gap_mm          = self.maxGapSpin.value,
+                fill_holes          = self.fillHolesCheck.isChecked(),
                 skip_done           = self.skipDoneCheck.isChecked(),
                 vertebrae_seg_names = vert_segs,
                 totalseg_file       = parent_seg_file,
@@ -789,9 +944,12 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
     # ── Scene entry point ─────────────────────────────────────────────────────
 
     def run_scene(self, suv_thresh, suv_clean_thresh, dilate_mm,
-                  pet_node, totalseg_node_name, vertebrae_seg_names, organ_configs):
+                  pet_node, totalseg_node_name, vertebrae_seg_names, organ_configs,
+                  connect_path=True, max_gap_mm=150.0, fill_holes=True,
+                  excl_configs=None):
         """
         organ_configs: list of (node_name, mode)
+        excl_configs:  list of dicts {'seg_node', 'seg_name', 'dilate_mm', 'suv_thresh'}
         Outputs one '<node>_processed' segmentation node per organ.
         """
         print("\n" + "="*60)
@@ -810,6 +968,9 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
                 z_inferior, z_superior, suv_thresh, dilate_mm,
                 seg_node_name='ureter_from_pet',
                 totalseg_node_name=totalseg_node_name,
+                connect_path=connect_path,
+                max_gap_mm=max_gap_mm,
+                fill_holes=fill_holes,
             )
 
         for organ_name, mode in organ_configs:
@@ -818,6 +979,7 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
                 ureter_arr, ureter_affine,
                 pet_arr, pet_affine, suv_clean_thresh,
                 z_inferior, z_superior,
+                excl_configs=excl_configs,
             )
 
         print("\n" + "="*60)
@@ -828,6 +990,7 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
 
     def run_bulk(self, dataset_clean_root, suv_thresh, suv_clean_thresh,
                  dilate_mm, skip_done,
+                 connect_path=True, max_gap_mm=150.0, fill_holes=True,
                  vertebrae_seg_names=None,
                  totalseg_file='TotalSeg_abdomen.seg.nrrd',
                  organ_file_configs=None,
@@ -920,6 +1083,9 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
                         z_inferior, z_superior, suv_thresh, dilate_mm,
                         seg_node_name='ureter_from_pet',
                         totalseg_node_name=loaded_totalseg_name,
+                        connect_path=connect_path,
+                        max_gap_mm=max_gap_mm,
+                        fill_holes=fill_holes,
                     )
                     ureter_out = os.path.join(seg_dir, 'ureter_from_pet.nii.gz')
                     self._export_seg_to_nifti('ureter_from_pet', ureter_out)
@@ -956,7 +1122,8 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
     def _process_organ_scene(self, organ_name, mode,
                               ureter_arr, ureter_affine,
                               pet_arr, pet_affine, suv_clean_thresh,
-                              z_inferior, z_superior):
+                              z_inferior, z_superior,
+                              excl_configs=None):
         import numpy as np
         print(f"\n[ORGAN] '{organ_name}' mode={mode}")
         try:
@@ -977,6 +1144,27 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
                                      ureter_arr, ureter_affine,
                                      pet_arr, pet_affine, suv_clean_thresh,
                                      z_inferior, z_superior)
+
+        # ── Apply extra exclusion masks ───────────────────────────────────────
+        if excl_configs:
+            for excl in excl_configs:
+                try:
+                    excl_arr, excl_affine = self._build_mask_from_seg(
+                        excl['seg_node'], excl['dilate_mm'], excl.get('seg_name'),
+                        save_to_scene=True)
+                    excl_in = self._resample_to_target(
+                        excl_arr, excl_affine, arr.shape, affine)
+                    pet_in  = self._resample_to_target(
+                        pet_arr, pet_affine, arr.shape, affine)
+                    remove = ((arr > 0) & (excl_in > 0) & (pet_in > excl['suv_thresh']))
+                    arr[remove] = 0
+                    label = (excl.get('seg_name') or 'all')
+                    print(f"[ORGAN]   Excl '{excl['seg_node'].GetName()}/{label}' "
+                          f"removed {int(remove.sum())} voxels "
+                          f"(SUV>{excl['suv_thresh']}, dil={excl['dilate_mm']}mm)")
+                except Exception as e:
+                    print(f"[ORGAN]   Excl error: {e}")
+
         after = int((arr > 0).sum())
         print(f"[ORGAN]   before={before}  after={after}  removed={before-after}")
 
@@ -1105,6 +1293,7 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
     def _build_ureter_mask(self, pet_arr, pet_affine, pet_mat, vox_size,
                             z_inferior, z_superior, suv_thresh, dilate_mm,
                             seg_node_name, totalseg_node_name=None,
+                            connect_path=True, max_gap_mm=150.0, fill_holes=True,
                             ureter_ext_inf_mm=200.0, torso_radius_mm=220.0):
         """
         Build the ureter exclusion mask from PET.
@@ -1183,6 +1372,24 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
             hot_clipped, structure=struct_3d).astype(np.uint8)
         print(f"[URETER] After {dilate_mm}mm dilation: {int(ureter_mask.sum())} voxels")
 
+        # ── Connect disconnected ureter fragments (vertical cylinder only) ─────
+        if connect_path:
+            tube_r = max(3, int(round(dilate_mm / max(float(vox_size.max()), 1e-6) * 0.5)))
+            ureter_mask = self._connect_ureter_path(
+                ureter_mask, vox_size,
+                max_gap_mm=max_gap_mm,
+                tube_radius_vox=tube_r,
+            )
+
+        # ── Fill per-slice holes ───────────────────────────────────────────────
+        if fill_holes:
+            from scipy.ndimage import binary_fill_holes
+            before_fh = int(ureter_mask.sum())
+            for z in range(ureter_mask.shape[0]):
+                if ureter_mask[z].any():
+                    ureter_mask[z] = binary_fill_holes(ureter_mask[z]).astype(np.uint8)
+            print(f"[URETER] Fill holes: {before_fh} → {int(ureter_mask.sum())} voxels")
+
         lm_name = seg_node_name + '_lm'
         self._remove_existing(lm_name)
         lm = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLLabelMapVolumeNode', lm_name)
@@ -1197,6 +1404,82 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
         print(f"[URETER] '{seg_node_name}' added to scene.")
 
         return ureter_mask, pet_affine
+
+    # ── Ureter connectivity (pure vertical cylinder) ──────────────────────────
+
+    def _connect_ureter_path(self, mask_arr, vox_size, max_gap_mm=150.0, tube_radius_vox=3):
+        """
+        Bridge gaps between adjacent disconnected ureter fragments.
+
+        For each consecutive pair of fragments (sorted by Z mid-point):
+        - Gap is measured purely in Z (voxels × mm/vox).
+        - The bridge is a vertical cylinder with a FIXED XY centre derived
+          from the average of the two face centroids — no lateral drift.
+        - The cylinder is stamped as a disk at every Z slice in the gap.
+        """
+        import numpy as np
+        from scipy import ndimage
+
+        labeled, n = ndimage.label(mask_arr)
+        if n <= 1:
+            return mask_arr.copy()
+
+        z_mm_per_vox = abs(float(vox_size[2]))
+
+        components = []
+        for comp_id in range(1, n + 1):
+            comp_vox = np.argwhere(labeled == comp_id)
+            z_min = int(comp_vox[:, 0].min())
+            z_max = int(comp_vox[:, 0].max())
+            bot_face = comp_vox[comp_vox[:, 0] == z_min]
+            top_face = comp_vox[comp_vox[:, 0] == z_max]
+            components.append({
+                'z_min': z_min,
+                'z_max': z_max,
+                'z_mid': (z_min + z_max) / 2.0,
+                'bot':   bot_face.mean(axis=0).astype(np.float64),  # (Z,Y,X)
+                'top':   top_face.mean(axis=0).astype(np.float64),
+            })
+
+        components.sort(key=lambda c: c['z_mid'])
+        result = mask_arr.copy()
+
+        for i in range(len(components) - 1):
+            c_lo = components[i]
+            c_hi = components[i + 1]
+
+            z_gap_vox = c_hi['z_min'] - c_lo['z_max']
+            z_gap_mm  = float(z_gap_vox) * z_mm_per_vox
+            if z_gap_mm > max_gap_mm:
+                print(f"[CONNECT]   Z gap {z_gap_mm:.1f} mm > {max_gap_mm} mm — skipping")
+                continue
+
+            # Fixed XY centre — average of the two facing centroid faces
+            cy = (c_lo['top'][1] + c_hi['bot'][1]) / 2.0
+            cx = (c_lo['top'][2] + c_hi['bot'][2]) / 2.0
+            z_lo = c_lo['z_max']
+            z_hi = c_hi['z_min']
+
+            r  = tube_radius_vox
+            y0 = max(0, int(cy) - r - 1)
+            y1 = min(mask_arr.shape[1] - 1, int(cy) + r + 1)
+            x0 = max(0, int(cx) - r - 1)
+            x1 = min(mask_arr.shape[2] - 1, int(cx) + r + 1)
+
+            yy, xx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+            disk = ((yy - cy) ** 2 + (xx - cx) ** 2) <= float(r) ** 2
+
+            for z in range(z_lo, z_hi + 1):
+                result[z, y0:y1 + 1, x0:x1 + 1][disk] = 1
+
+            print(f"[CONNECT]   Bridged comp {i}→{i+1}: "
+                  f"Z {z_lo}→{z_hi} ({z_gap_mm:.1f} mm), "
+                  f"XY centre ({cy:.1f},{cx:.1f}), r={r}vox")
+
+        after  = int((result > 0).sum())
+        before = int((mask_arr > 0).sum())
+        print(f"[CONNECT] Done: {before} → {after} voxels (+{after - before})")
+        return result.astype(np.uint8)
 
     # ── Bulk helpers ──────────────────────────────────────────────────────────
 
@@ -1395,6 +1678,74 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
         except Exception as e:
             print(f"[URETER] Could not compute vertebrae centroid ({e}) — using image centre")
             return 0.0, 0.0
+
+    def _build_mask_from_seg(self, seg_node, dilate_mm, seg_name=None,
+                             save_to_scene=False):
+        """
+        Export a segmentation node (or one of its sub-segments) to a binary
+        numpy array, optionally dilate it by *dilate_mm* millimetres, and
+        return (arr, affine).
+
+        If *save_to_scene* is True the dilated mask is also written back into
+        a new SegmentationNode named  <seg_node>_<seg_label>_dilated  so the
+        user can inspect how far the dilation extends.
+        """
+        import numpy as np
+        from scipy import ndimage
+
+        lm = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLLabelMapVolumeNode', '_excl_tmp')
+
+        if seg_name:
+            seg    = seg_node.GetSegmentation()
+            seg_id = None
+            for i in range(seg.GetNumberOfSegments()):
+                if seg.GetNthSegment(i).GetName() == seg_name:
+                    seg_id = seg.GetNthSegmentID(i)
+                    break
+            if seg_id is None:
+                slicer.mrmlScene.RemoveNode(lm)
+                raise ValueError(f"Segment '{seg_name}' not found in "
+                                 f"'{seg_node.GetName()}'")
+            seg_ids = vtk.vtkStringArray()
+            seg_ids.InsertNextValue(seg_id)
+            slicer.modules.segmentations.logic().ExportSegmentsToLabelmapNode(
+                seg_node, seg_ids, lm, None,
+                slicer.vtkSegmentation.EXTENT_UNION_OF_SEGMENTS)
+        else:
+            slicer.modules.segmentations.logic().ExportAllSegmentsToLabelmapNode(
+                seg_node, lm)
+
+        arr = slicer.util.arrayFromVolume(lm).copy().astype(np.uint8)
+        mat = vtk.vtkMatrix4x4()
+        lm.GetIJKToRASMatrix(mat)
+        affine = self._mat_to_np(mat)
+
+        seg_label = seg_name or "all"
+        if dilate_mm > 0:
+            vox_size   = np.array([abs(affine[0, 0]), abs(affine[1, 1]), abs(affine[2, 2])])
+            mean_vox   = float(vox_size.mean())
+            iterations = max(1, int(round(dilate_mm / mean_vox)))
+            struct     = ndimage.generate_binary_structure(3, 1)
+            arr = ndimage.binary_dilation(
+                arr > 0, structure=struct, iterations=iterations).astype(np.uint8)
+            print(f"[EXCL] '{seg_node.GetName()}/{seg_label}': "
+                  f"dilated {dilate_mm} mm ({iterations} iter) "
+                  f"→ {int(arr.sum())} voxels")
+
+        # ── Optionally persist the dilated mask as a visible scene node ───────
+        if save_to_scene:
+            dilated_name = f"{seg_node.GetName()}_{seg_label}_dilated"
+            self._remove_existing(dilated_name)
+            slicer.util.updateVolumeFromArray(lm, arr)
+            dilated_seg = slicer.mrmlScene.AddNewNodeByClass(
+                'vtkMRMLSegmentationNode', dilated_name)
+            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+                lm, dilated_seg)
+            dilated_seg.CreateClosedSurfaceRepresentation()
+            print(f"[EXCL] '{dilated_name}' added to scene.")
+
+        slicer.mrmlScene.RemoveNode(lm)
+        return arr, affine
 
     def _resample_to_target(self, src_arr, src_affine, tgt_shape, tgt_affine):
         import numpy as np

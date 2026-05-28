@@ -68,6 +68,7 @@ class PETCTQuantAnalysis_v2Widget(ScriptedLoadableModuleWidget):
         self.logic = PETCTQuantAnalysis_v2Logic()
         self._scans = []          # list of scan dicts from detectScans
         self._seg_rows = []       # list of (stem, cb_widget, name_edit)
+        self._preview_nodes = []  # nodes loaded for the current preview
 
         # ── 1. DATA INPUT ──────────────────────────────────────────────
         col1 = ctk.ctkCollapsibleButton()
@@ -136,6 +137,17 @@ class PETCTQuantAnalysis_v2Widget(ScriptedLoadableModuleWidget):
             mBox.addWidget(cb)
         lay3.addRow("Metrics:", mWidget)
 
+        self.cbRegistration = qt.QCheckBox("CT-to-PET rigid registration")
+        self.cbRegistration.setChecked(False)
+        lay3.addRow("", self.cbRegistration)
+
+        self.dilationSpinBox = qt.QDoubleSpinBox()
+        self.dilationSpinBox.setRange(0.0, 20.0)
+        self.dilationSpinBox.setSingleStep(1.0)
+        self.dilationSpinBox.setValue(0.0)
+        self.dilationSpinBox.setSuffix(" mm")
+        lay3.addRow("Dilation margin (mm):", self.dilationSpinBox)
+
         # ── 4. EXPORT ─────────────────────────────────────────────────
         col4 = ctk.ctkCollapsibleButton()
         col4.text = "4. Export"
@@ -150,6 +162,29 @@ class PETCTQuantAnalysis_v2Widget(ScriptedLoadableModuleWidget):
         self.appendCb = qt.QCheckBox("Append to existing file")
         self.appendCb.setChecked(True)
         lay4.addRow("", self.appendCb)
+
+        # ── 5. PREVIEW ────────────────────────────────────────────────
+        col5 = ctk.ctkCollapsibleButton()
+        col5.text = "5. Preview — visual QC"
+        self.layout.addWidget(col5)
+        lay5 = qt.QFormLayout(col5)
+
+        self.previewCombo = qt.QComboBox()
+        self.previewCombo.setToolTip("Run 'Detect' first to populate this list")
+        lay5.addRow("Patient:", self.previewCombo)
+
+        previewBtnWidget = qt.QWidget()
+        previewBtnBox    = qt.QHBoxLayout(previewBtnWidget)
+        previewBtnBox.setContentsMargins(0, 0, 0, 0)
+        self.loadPreviewBtn  = qt.QPushButton("Load & Preview")
+        self.clearPreviewBtn = qt.QPushButton("Clear scene")
+        previewBtnBox.addWidget(self.loadPreviewBtn)
+        previewBtnBox.addWidget(self.clearPreviewBtn)
+        lay5.addRow("", previewBtnWidget)
+
+        self.previewStatusLabel = qt.QLabel("Select a patient and click Load & Preview.")
+        self.previewStatusLabel.setWordWrap(True)
+        lay5.addRow("Status:", self.previewStatusLabel)
 
         # ── RUN CONTROLS ──────────────────────────────────────────────
         self.startBtn = qt.QPushButton("START — run all patients")
@@ -179,6 +214,8 @@ class PETCTQuantAnalysis_v2Widget(ScriptedLoadableModuleWidget):
         self.detectBtn.connect('clicked(bool)', self.onDetect)
         self.startBtn.connect('clicked(bool)', self.onStart)
         self.cancelBtn.connect('clicked(bool)', self.onCancel)
+        self.loadPreviewBtn.connect('clicked(bool)', self.onPreview)
+        self.clearPreviewBtn.connect('clicked(bool)', self.onClearPreview)
         self._cancel = False
 
     # ── Detection ─────────────────────────────────────────────────────────
@@ -197,6 +234,10 @@ class PETCTQuantAnalysis_v2Widget(ScriptedLoadableModuleWidget):
 
         seg_info = self.logic.detectSegmentations(root, self._scans)
         self._buildSegTable(seg_info)
+
+        self.previewCombo.clear()
+        for s in self._scans:
+            self.previewCombo.addItem(f"{s['subject_id']}  |  {s['scan_date']}")
 
     def _buildSegTable(self, seg_info):
         """
@@ -294,18 +335,20 @@ class PETCTQuantAnalysis_v2Widget(ScriptedLoadableModuleWidget):
 
         try:
             self.logic.runBatch(
-                root_folder  = root,
-                scans        = self._scans,
-                seg_name_map = seg_name_map,
-                output_file  = output_file,
-                metrics      = metrics,
-                suv_type     = suv_type,
-                append       = self.appendCb.isChecked(),
-                progress_cb  = lambda v: (self.progressBar.setValue(int(v)),
-                                          slicer.app.processEvents()),
-                status_cb    = lambda m: (self.statusLabel.setText(m),
-                                          slicer.app.processEvents()),
-                cancel_check = lambda: self._cancel,
+                root_folder     = root,
+                scans           = self._scans,
+                seg_name_map    = seg_name_map,
+                output_file     = output_file,
+                metrics         = metrics,
+                suv_type        = suv_type,
+                append          = self.appendCb.isChecked(),
+                progress_cb     = lambda v: (self.progressBar.setValue(int(v)),
+                                             slicer.app.processEvents()),
+                status_cb       = lambda m: (self.statusLabel.setText(m),
+                                             slicer.app.processEvents()),
+                cancel_check    = lambda: self._cancel,
+                do_registration = self.cbRegistration.isChecked(),
+                dilation_mm     = self.dilationSpinBox.value,
             )
             slicer.util.infoDisplay(f"Done!\nResults saved to:\n{output_file}")
         except Exception as e:
@@ -318,6 +361,123 @@ class PETCTQuantAnalysis_v2Widget(ScriptedLoadableModuleWidget):
     def onCancel(self):
         self._cancel = True
         self.statusLabel.setText("Cancelling after current scan …")
+
+    # ── Preview ───────────────────────────────────────────────────────────
+
+    def onClearPreview(self):
+        for node in self._preview_nodes:
+            try:
+                slicer.mrmlScene.RemoveNode(node)
+            except Exception:
+                pass
+        self._preview_nodes.clear()
+        self.previewStatusLabel.setText("Scene cleared.")
+
+    def onPreview(self):
+        idx = self.previewCombo.currentIndex
+        if idx < 0 or not self._scans:
+            slicer.util.errorDisplay(
+                "Run 'Detect patients' first, then select a patient from the dropdown."
+            )
+            return
+
+        seg_name_map = self._getSegNameMap()
+        if not seg_name_map:
+            slicer.util.errorDisplay(
+                "Tick at least one segmentation in section 2 before previewing."
+            )
+            return
+
+        scan     = self._scans[idx]
+        seg_path = scan.get("seg_path") or ""
+
+        self.onClearPreview()
+
+        # ── Load PET ──────────────────────────────────────────────────
+        self.previewStatusLabel.setText("Loading PET DICOM…")
+        slicer.app.processEvents()
+        try:
+            pet_node = self.logic._loadDicomSeries(
+                scan["pet_path"], scan["subject_id"]
+            )
+        except Exception as e:
+            slicer.util.errorDisplay(f"Failed to load PET: {e}")
+            self.previewStatusLabel.setText("PET load failed.")
+            return
+
+        self._preview_nodes.append(pet_node)
+
+        # Make PET the background in all slice viewers
+        slicer.util.setSliceViewerLayers(background=pet_node)
+        for name in slicer.app.layoutManager().sliceViewNames():
+            slicer.app.layoutManager().sliceWidget(name).sliceLogic().FitSliceToAll()
+
+        # ── Fiducial node for hotspots ─────────────────────────────────
+        fid_node = slicer.mrmlScene.AddNewNodeByClass(
+            'vtkMRMLMarkupsFiducialNode', 'PETCTQuant_Hotspots'
+        )
+        self._preview_nodes.append(fid_node)
+        disp = fid_node.GetDisplayNode()
+        if disp:
+            disp.SetTextScale(3.5)
+            disp.SetGlyphScale(3.0)
+            disp.SetColor(1.0, 1.0, 0.0)   # yellow
+
+        # ── Process each selected segmentation ────────────────────────
+        loaded_segs = 0
+        for stem, display_name in seg_name_map.items():
+            seg_file = os.path.join(seg_path, f"{stem}.nii.gz") if seg_path else None
+            if not seg_file or not os.path.isfile(seg_file):
+                continue
+
+            self.previewStatusLabel.setText(f"Finding hotspot: {display_name}…")
+            slicer.app.processEvents()
+
+            try:
+                seg_node = self.logic._loadSegmentation(seg_file)
+                self._preview_nodes.append(seg_node)
+
+                segmentation = seg_node.GetSegmentation()
+                segment_id   = segmentation.GetNthSegmentID(0)
+
+                label_node = slicer.mrmlScene.AddNewNodeByClass(
+                    'vtkMRMLLabelMapVolumeNode', f'prev_lbl_{stem}'
+                )
+                seg_ids = vtk.vtkStringArray()
+                seg_ids.InsertNextValue(segment_id)
+                slicer.modules.segmentations.logic().ExportSegmentsToLabelmapNode(
+                    seg_node, seg_ids, label_node, pet_node,
+                    slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY,
+                )
+
+                hotspots = self.logic._findHottestVoxels(pet_node, label_node, top_n=1)
+                slicer.mrmlScene.RemoveNode(label_node)
+
+                if hotspots:
+                    h   = hotspots[0]
+                    lbl = f"{display_name}: SUV {h['suv']:.2f}"
+                    try:
+                        pt = fid_node.AddControlPoint(
+                            vtk.vtkVector3d(h["ras_x"], h["ras_y"], h["ras_z"])
+                        )
+                        fid_node.SetNthControlPointLabel(pt, lbl)
+                    except AttributeError:
+                        pt = fid_node.AddFiducial(h["ras_x"], h["ras_y"], h["ras_z"])
+                        fid_node.SetNthFiducialLabel(pt, lbl)
+
+                loaded_segs += 1
+
+            except Exception as e:
+                LOG.warning(f"[PETCTQuant-v2] Preview — {display_name} failed: {e}")
+
+        try:
+            n_pts = fid_node.GetNumberOfControlPoints()
+        except AttributeError:
+            n_pts = fid_node.GetNumberOfFiducials()
+
+        self.previewStatusLabel.setText(
+            f"Ready — PET + {loaded_segs} seg(s), {n_pts} hotspot fiducial(s) placed."
+        )
 
 
 # ── LOGIC ──────────────────────────────────────────────────────────────────
@@ -455,7 +615,8 @@ class PETCTQuantAnalysis_v2Logic(ScriptedLoadableModuleLogic):
 
     def runBatch(self, root_folder, scans, seg_name_map,
                  output_file, metrics, suv_type, append,
-                 progress_cb, status_cb, cancel_check):
+                 progress_cb, status_cb, cancel_check,
+                 do_registration=False, dilation_mm=0.0):
         """
         seg_name_map: {stem: display_name}  — only these files are processed.
         """
@@ -516,6 +677,33 @@ class PETCTQuantAnalysis_v2Logic(ScriptedLoadableModuleLogic):
                     f"Results will be in raw DICOM units (Bq/mL), not SUV",
                     status_cb)
 
+            # ── Step 1c: CT-to-PET rigid registration (optional) ──────────────
+            ct_node             = None
+            ct_to_pet_transform = None
+            if do_registration:
+                ct_path = scan.get("ct_path")
+                if ct_path:
+                    self._log("info",
+                        f"  Step 1c — loading CT DICOM for registration: {ct_path}",
+                        status_cb)
+                    try:
+                        ct_node = self._loadDicomSeries(ct_path, subj)
+                        ct_node.SetName(f"CT_{subj}")
+                        self._log("info",
+                            f"  Step 1c — CT loaded OK  node={ct_node.GetName()}")
+                        ct_to_pet_transform = self._registerCtToPet(ct_node, pet_node)
+                    except Exception as e:
+                        self._log("error",
+                            f"  Step 1c FAILED — registration skipped: {e}", status_cb)
+                        if ct_node:
+                            slicer.mrmlScene.RemoveNode(ct_node)
+                        ct_node             = None
+                        ct_to_pet_transform = None
+                else:
+                    self._log("warning",
+                        "  Step 1c — do_registration=True but no CT folder found "
+                        "— skipping", status_cb)
+
             # ── Step 2: (TotalSegmentator skipped in v2 — segs assumed present)
             self._log("info", "  Step 2/4 — skipped (using existing segments)")
 
@@ -550,6 +738,18 @@ class PETCTQuantAnalysis_v2Logic(ScriptedLoadableModuleLogic):
                         f"    [{display_name}] segmentation loaded OK  "
                         f"node={seg_node.GetName()}")
 
+                    if ct_to_pet_transform is not None:
+                        self._log("info",
+                            f"    [{display_name}] applying CT-to-PET transform...",
+                            status_cb)
+                        self._applyTransformToSeg(seg_node, ct_to_pet_transform)
+
+                    if dilation_mm > 0:
+                        self._log("info",
+                            f"    [{display_name}] dilating mask by {dilation_mm} mm...",
+                            status_cb)
+                        self._dilateMask(seg_node, dilation_mm)
+
                     self._log("info",
                         f"    [{display_name}] running pet-indic CLI...", status_cb)
                     results = self._runPetIndic(pet_node, seg_node, metrics, suv_type)
@@ -583,6 +783,12 @@ class PETCTQuantAnalysis_v2Logic(ScriptedLoadableModuleLogic):
                         self._errorRow(subj, date, display_name,
                                        f"error: {str(e)[:80]}", patient_id))
 
+            if ct_to_pet_transform is not None:
+                slicer.mrmlScene.RemoveNode(ct_to_pet_transform)
+                self._log("info", "  CT-to-PET transform node removed from scene")
+            if ct_node is not None:
+                slicer.mrmlScene.RemoveNode(ct_node)
+                self._log("info", "  CT node removed from scene")
             slicer.mrmlScene.RemoveNode(pet_node)
             self._log("info",
                 f"  PET node removed from scene — memory freed for next patient")
@@ -749,6 +955,172 @@ class PETCTQuantAnalysis_v2Logic(ScriptedLoadableModuleLogic):
             f"    _loadSegmentation: OK — node={node.GetName()}  segments={n_segs}")
         return node
 
+    def _registerCtToPet(self, ct_node, pet_node):
+        """
+        BRAINSFit rigid (6 DOF) registration: CT (moving) → PET (fixed).
+        Metric: Mattes Mutual Information, sampling 2%.
+        Returns vtkMRMLLinearTransformNode with the CT-to-PET transform.
+        """
+        self._log("info", "    _registerCtToPet: creating output transform node...")
+        transform_node = slicer.mrmlScene.AddNewNodeByClass(
+            'vtkMRMLLinearTransformNode', 'CT_to_PET_rigid'
+        )
+
+        params = {
+            'fixedVolume':             pet_node.GetID(),
+            'movingVolume':            ct_node.GetID(),
+            'linearTransform':         transform_node.GetID(),
+            'useRigid':                True,
+            'costMetric':              'MMI',
+            'samplingPercentage':      0.02,
+            'initializeTransformMode': 'useMomentsAlign',
+        }
+
+        self._log("info", f"    _registerCtToPet: BRAINSFit params — {params}")
+        self._log("info",
+            "    _registerCtToPet: running BRAINSFit (wait_for_completion=True)...")
+
+        cli_node = slicer.cli.run(
+            slicer.modules.brainsfit, None, params, wait_for_completion=True
+        )
+        status = cli_node.GetStatusString()
+        self._log("info", f"    _registerCtToPet: BRAINSFit finished — status={status}")
+        slicer.mrmlScene.RemoveNode(cli_node)
+
+        matrix = vtk.vtkMatrix4x4()
+        transform_node.GetMatrixTransformToParent(matrix)
+        mat_rows = []
+        for r in range(4):
+            row = [f"{matrix.GetElement(r, c):+.4f}" for c in range(4)]
+            mat_rows.append("[" + "  ".join(row) + "]")
+        self._log("info",
+            "    _registerCtToPet: CT→PET transform matrix:\n"
+            + "\n".join(f"      {r}" for r in mat_rows))
+
+        return transform_node
+
+    def _applyTransformToSeg(self, seg_node, transform_node):
+        """Harden transform_node onto seg_node (bakes the transform in-place)."""
+        self._log("info",
+            f"    _applyTransformToSeg: setting transform {transform_node.GetID()} "
+            f"on '{seg_node.GetName()}' and hardening...")
+        seg_node.SetAndObserveTransformNodeID(transform_node.GetID())
+        slicer.vtkSlicerTransformLogic().hardenTransform(seg_node)
+        self._log("info", "    _applyTransformToSeg: transform hardened successfully")
+
+    def _dilateMask(self, seg_node, margin_mm):
+        """
+        Dilate the first segment in seg_node by margin_mm mm using the Segment
+        Editor Margin effect.  Logs voxel count before and after via
+        slicer.modules.segmentations.logic().
+        """
+        import numpy as np
+
+        if margin_mm <= 0:
+            return
+
+        segmentation = seg_node.GetSegmentation()
+        segment_id   = segmentation.GetNthSegmentID(0)
+
+        def _count_voxels():
+            tmp = slicer.mrmlScene.AddNewNodeByClass(
+                'vtkMRMLLabelMapVolumeNode', 'tmp_dilate_count'
+            )
+            slicer.modules.segmentations.logic().ExportAllSegmentsToLabelmapNode(
+                seg_node, tmp
+            )
+            count = int(np.count_nonzero(slicer.util.arrayFromVolume(tmp) > 0))
+            slicer.mrmlScene.RemoveNode(tmp)
+            return count
+
+        before_count = _count_voxels()
+        self._log("info",
+            f"    _dilateMask: voxels before dilation = {before_count}")
+
+        seg_editor_widget = slicer.qMRMLSegmentEditorWidget()
+        seg_editor_widget.setMRMLScene(slicer.mrmlScene)
+        seg_editor_node = slicer.mrmlScene.AddNewNodeByClass(
+            'vtkMRMLSegmentEditorNode', 'SegEditor_dilate'
+        )
+        seg_editor_widget.setMRMLSegmentEditorNode(seg_editor_node)
+        seg_editor_widget.setSegmentationNode(seg_node)
+        seg_editor_widget.setCurrentSegmentID(segment_id)
+
+        seg_editor_widget.setActiveEffectByName("Margin")
+        effect = seg_editor_widget.activeEffect()
+        if effect is None:
+            slicer.mrmlScene.RemoveNode(seg_editor_node)
+            raise RuntimeError(
+                "Margin effect not available — ensure SegmentEditorMarginEffect "
+                "extension is loaded"
+            )
+
+        effect.setParameter("MarginSizeMm", str(margin_mm))
+        effect.self().onApply()
+
+        seg_editor_widget.setActiveEffectByName(None)
+        slicer.mrmlScene.RemoveNode(seg_editor_node)
+
+        after_count = _count_voxels()
+        self._log("info",
+            f"    _dilateMask: dilation by {margin_mm} mm complete — "
+            f"voxels: {before_count} → {after_count}  "
+            f"(Δ = {after_count - before_count:+d})")
+
+    def _findHottestVoxels(self, pet_node, label_node, top_n=10):
+        """
+        Find the top_n voxels with highest SUV inside the label mask.
+
+        Returns list of dicts (length ≤ top_n), sorted descending by SUV:
+            {"suv": float, "ras_x": float, "ras_y": float, "ras_z": float}
+
+        arrayFromVolume returns shape (Z, Y, X) = (K, J, I).
+        GetIJKToRASMatrix maps column vector [I, J, K, 1]^T → RAS.
+        """
+        import numpy as np
+
+        pet_arr   = slicer.util.arrayFromVolume(pet_node)    # (Z, Y, X)
+        label_arr = slicer.util.arrayFromVolume(label_node)  # (Z, Y, X)
+
+        mask_indices = np.argwhere(label_arr > 0)  # shape (N, 3): [z, y, x]
+        n_mask = len(mask_indices)
+        self._log("info",
+            f"    _findHottestVoxels: {n_mask} label voxel(s) found  top_n={top_n}")
+
+        if n_mask == 0:
+            self._log("warning",
+                "    _findHottestVoxels: mask is empty — returning []")
+            return []
+
+        pet_vals = pet_arr[
+            mask_indices[:, 0],
+            mask_indices[:, 1],
+            mask_indices[:, 2],
+        ]
+
+        order   = np.argsort(pet_vals)[::-1]
+        top_idx = order[:top_n]
+
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        pet_node.GetIJKToRASMatrix(ijk_to_ras)
+
+        hotspots = []
+        for idx in top_idx:
+            z, y, x = mask_indices[idx]
+            suv_val = float(pet_vals[idx])
+            ras_h   = ijk_to_ras.MultiplyPoint([float(x), float(y), float(z), 1.0])
+            hotspots.append({
+                "suv":   suv_val,
+                "ras_x": float(ras_h[0]),
+                "ras_y": float(ras_h[1]),
+                "ras_z": float(ras_h[2]),
+            })
+
+        self._log("info",
+            f"    _findHottestVoxels: top-{len(hotspots)} hotspots computed  "
+            f"max SUV={hotspots[0]['suv']:.4f}")
+        return hotspots
+
     def _runPetIndic(self, pet_node, seg_node, metrics, suv_type):
         """
         Run QuantitativeIndicesTool CLI on pet_node + seg_node.
@@ -853,6 +1225,26 @@ class PETCTQuantAnalysis_v2Logic(ScriptedLoadableModuleLogic):
                     f"    _runPetIndic: volume={results['volume_mL']:.3f} mL  "
                     f"(measured in PET voxel space — ~1-2% smaller than CT-resolution "
                     f"Segment Stats due to resampling, this is expected)")
+
+            self._log("info", "    _runPetIndic: finding hottest voxels...")
+            try:
+                hotspots = self._findHottestVoxels(pet_node, label_node, top_n=10)
+                if hotspots:
+                    h = hotspots[0]
+                    results["hotspot_suv"]   = h["suv"]
+                    results["hotspot_ras_x"] = h["ras_x"]
+                    results["hotspot_ras_y"] = h["ras_y"]
+                    results["hotspot_ras_z"] = h["ras_z"]
+                    self._log("info",
+                        f"    _runPetIndic: top-1 hotspot — "
+                        f"SUV={h['suv']:.4f}  "
+                        f"RAS=({h['ras_x']:.1f}, {h['ras_y']:.1f}, {h['ras_z']:.1f})")
+                else:
+                    self._log("warning",
+                        "    _runPetIndic: no label voxels found for hotspot analysis")
+            except Exception as e:
+                self._log("warning",
+                    f"    _runPetIndic: hotspot finding failed: {e}")
 
             return results
 
@@ -1024,8 +1416,10 @@ class PETCTQuantAnalysis_v2Logic(ScriptedLoadableModuleLogic):
         DATA_COLS   = ["subject_id", "patient_id", "scan_date",
                        "segment", "source_file",
                        "volume_mL", "suv_mean", "suv_max", "suv_peak", "tlg",
+                       "hotspot_suv", "hotspot_ras_x", "hotspot_ras_y", "hotspot_ras_z",
                        "status", "computed_at"]
-        METRIC_COLS = ["volume_mL", "suv_mean", "suv_max", "suv_peak", "tlg"]
+        METRIC_COLS = ["volume_mL", "suv_mean", "suv_max", "suv_peak", "tlg",
+                       "hotspot_suv", "hotspot_ras_x", "hotspot_ras_y", "hotspot_ras_z"]
 
         self._log("info",
             f"_saveExcel: {len(rows)} row(s) to write  append={append}  "
