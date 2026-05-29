@@ -158,6 +158,13 @@ class DistanceMeasurerWidget(ScriptedLoadableModuleWidget):
             slicer.vtkMRMLScene.NodeRemovedEvent, self._on_scene_node_removed)
 
     def cleanup(self):
+        # Reset interaction mode so closing this window never leaves placement stuck
+        try:
+            interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+            interactionNode.SetCurrentInteractionMode(
+                slicer.vtkMRMLInteractionNode.ViewTransform)
+        except Exception:
+            pass
         slicer.mrmlScene.RemoveObserver(self._sceneObserverTag)
         for rd in list(self._rows):
             self._delete_row(rd, remove_node=False)
@@ -193,13 +200,15 @@ class DistanceMeasurerWidget(ScriptedLoadableModuleWidget):
             lambda c, e, r=rd: self._update_distance(r))
         rd['observers'] = [obs1, obs2]
 
-        # Activate placement mode (click once → point 1, click again → point 2)
-        slicer.app.applicationLogic().GetInteractionNode() \
-            .SetCurrentInteractionMode(
-                slicer.vtkMRMLInteractionNode.Place)
-        selectionNode = slicer.app.applicationLogic().GetSelectionNode()
-        selectionNode.SetReferenceActiveMarkupsID(line_node.GetID())
+        # Activate placement mode (click once → point 1, click again → point 2).
+        # Cancel any active placement first so switching from another markup type
+        # (e.g. fiducial seeds in Vessel Segmenter) is not a no-op.
+        interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+        interactionNode.SetCurrentInteractionMode(
+            slicer.vtkMRMLInteractionNode.ViewTransform)
         slicer.modules.markups.logic().SetActiveListID(line_node)
+        interactionNode.SetCurrentInteractionMode(
+            slicer.vtkMRMLInteractionNode.Place)
 
         self._noMeasLabel.setVisible(False)
 
