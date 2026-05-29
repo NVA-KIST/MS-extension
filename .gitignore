@@ -1,7 +1,7 @@
 dataset_clean/
 dataset_test/
 samples/
-_pycache_/
+__pycache__/
 dataset_clean.egg
 dataset_test.zip
 totalseg_20260528_141236.log
