@@ -2,3 +2,7 @@ dataset_clean/
 dataset_test/
 samples/
 _pycache_/
+dataset_clean.egg
+dataset_test.zip
+totalseg_20260528_141236.log
+extension/__pycache__/
