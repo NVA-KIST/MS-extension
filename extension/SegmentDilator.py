@@ -253,9 +253,6 @@ class SegmentDilatorWidget(ScriptedLoadableModuleWidget):
         if not src_configs:
             self.statusLabel.setText("Status: add at least one dilation source.")
             return
-        if not tgt_configs:
-            self.statusLabel.setText("Status: add at least one target segment.")
-            return
 
         self.runButton.setEnabled(False)
         self.statusLabel.setText("Status: running…")
