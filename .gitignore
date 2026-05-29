@@ -6,3 +6,7 @@ dataset_clean.egg
 dataset_test.zip
 totalseg_20260528_141236.log
 extension/__pycache__/
+~$postprocessing.pptx
+docs/
+.vscode/
+
