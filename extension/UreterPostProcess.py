@@ -74,19 +74,19 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
         self.suvThreshSpin = qt.QDoubleSpinBox()
         self.suvThreshSpin.setRange(0.1, 20.0)
         self.suvThreshSpin.setSingleStep(0.5)
-        self.suvThreshSpin.setValue(4.0)
+        self.suvThreshSpin.setValue(2.0)
         form.addRow("SUV threshold (ureter):", self.suvThreshSpin)
 
         self.suvCleanSpin = qt.QDoubleSpinBox()
         self.suvCleanSpin.setRange(0.1, 20.0)
         self.suvCleanSpin.setSingleStep(0.5)
-        self.suvCleanSpin.setValue(2.0)
+        self.suvCleanSpin.setValue(1.2)
         form.addRow("SUV threshold (organ clean):", self.suvCleanSpin)
 
         self.dilateSpin = qt.QDoubleSpinBox()
         self.dilateSpin.setRange(1.0, 50.0)
         self.dilateSpin.setSingleStep(1.0)
-        self.dilateSpin.setValue(13.0)
+        self.dilateSpin.setValue(18.0)
         form.addRow("Dilation radius (mm):", self.dilateSpin)
 
         self.connectUreterCheck = qt.QCheckBox("Connect ureter path (link fragments)")
@@ -100,7 +100,7 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
         self.maxGapSpin = qt.QDoubleSpinBox()
         self.maxGapSpin.setRange(10.0, 300.0)
         self.maxGapSpin.setSingleStep(10.0)
-        self.maxGapSpin.setValue(150.0)
+        self.maxGapSpin.setValue(35.0)
         self.maxGapSpin.setSuffix(" mm")
         self.maxGapSpin.setToolTip(
             "Maximum Z gap between fragment borders to bridge. "
@@ -149,6 +149,24 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
         self.petSelector.setToolTip("SUVbw PET volume node")
         sceneForm.addRow("PET volume:", self.petSelector)
 
+        # ── Ureter mask on/off switch ──────────────────────────────────────
+        self.generateUreterCheck = qt.QCheckBox(
+            "Generate ureter mask  (uncheck to apply exclusion masks / clipping only)")
+        self.generateUreterCheck.setChecked(True)
+        self.generateUreterCheck.setStyleSheet(
+            "font-weight:bold; padding:4px; color:#1b5e20;")
+        self.generateUreterCheck.setToolTip(
+            "When unchecked:\n"
+            "  • No ureter mask is built (PET threshold step is skipped entirely)\n"
+            "  • 'Clean only' and 'Clip + Clean' organ modes still run, but the\n"
+            "    ureter-overlap removal step is skipped — only clipping applies\n"
+            "  • Extra exclusion masks still work normally\n"
+            "  • TotalSeg node is only required if you have clip-mode organs\n\n"
+            "Use this when you already have a good mask and just want to apply\n"
+            "exclusion masks or Z-clipping without rebuilding the ureter mask.")
+        self.generateUreterCheck.toggled.connect(self._on_ureter_toggle)
+        sceneLayout.addWidget(self.generateUreterCheck)
+
         self.totalSegSelector = slicer.qMRMLNodeComboBox()
         self.totalSegSelector.nodeTypes = ['vtkMRMLSegmentationNode']
         self.totalSegSelector.addEnabled = False
@@ -165,6 +183,20 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
         self.vertebraeList = qt.QListWidget()
         self.vertebraeList.setFixedHeight(120)
         sceneLayout.addWidget(self.vertebraeList)
+
+        # Inferior ureter boundary
+        infBoundLbl = qt.QLabel(
+            "Inferior ureter boundary segment (e.g. sacrum — "
+            "its inferior Z border caps the ureter mask downward):")
+        infBoundLbl.setWordWrap(True)
+        sceneLayout.addWidget(infBoundLbl)
+        self.inferiorSegCombo = qt.QComboBox()
+        self.inferiorSegCombo.addItem("None (use fixed 90 mm offset below L5)")
+        self.inferiorSegCombo.setToolTip(
+            "Pick a segment from the TotalSeg node whose INFERIOR Z border "
+            "becomes the hard lower limit of the ureter mask.\n"
+            "Recommended: 'sacrum' — stops the mask from going into the thighs.")
+        sceneLayout.addWidget(self.inferiorSegCombo)
 
         # Per-organ processing rows
         sceneLayout.addWidget(qt.QLabel("Organs to process (set mode per organ):"))
@@ -352,6 +384,29 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
         self.scenePanel.setVisible(scene_checked)
         self.bulkPanel.setVisible(not scene_checked)
 
+    # ── Ureter on/off toggle ──────────────────────────────────────────────────
+
+    def _on_ureter_toggle(self, enabled):
+        """Grey out all ureter-specific controls when the switch is off."""
+        ureter_widgets = [
+            self.totalSegSelector,
+            self.vertebraeList,
+            self.inferiorSegCombo,
+            self.connectUreterCheck,
+            self.maxGapSpin,
+            self.fillHolesCheck,
+            self.suvThreshSpin,
+        ]
+        for w in ureter_widgets:
+            w.setEnabled(enabled)
+        color = "#1b5e20" if enabled else "#b71c1c"
+        label = ("Generate ureter mask  (uncheck to apply exclusion masks / clipping only)"
+                 if enabled else
+                 "⊘  Ureter mask OFF — exclusion masks and clipping still active")
+        self.generateUreterCheck.setText(label)
+        self.generateUreterCheck.setStyleSheet(
+            f"font-weight:bold; padding:4px; color:{color};")
+
     # ── Bulk: folder scanning ─────────────────────────────────────────────────
 
     def onBrowse(self):
@@ -516,7 +571,7 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
 
     # ── Scene: exclusion mask rows ────────────────────────────────────────────
 
-    def _add_excl_row(self, dilate_mm=5.0, suv_thresh=2.0):
+    def _add_excl_row(self, dilate_mm=5.0, suv_thresh=1.2):
         frame = qt.QFrame()
         frame.setFrameShape(qt.QFrame.StyledPanel)
         outer = qt.QVBoxLayout(frame)
@@ -776,6 +831,27 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
 
     def onTotalSegChanged(self, node):
         self._populate_vertebrae_list(node)
+        self._populate_inferior_seg_combo(node)
+
+    def _populate_inferior_seg_combo(self, seg_node):
+        current = self.inferiorSegCombo.currentText
+        self.inferiorSegCombo.clear()
+        self.inferiorSegCombo.addItem("None (use fixed 90 mm offset below L5)")
+        if seg_node is None:
+            return
+        seg = seg_node.GetSegmentation()
+        for i in range(seg.GetNumberOfSegments()):
+            name = seg.GetNthSegment(i).GetName()
+            self.inferiorSegCombo.addItem(name)
+            # Auto-select sacrum if present
+            if name.lower() == 'sacrum':
+                self.inferiorSegCombo.setCurrentIndex(
+                    self.inferiorSegCombo.count - 1)
+        # Restore previous selection if still present
+        if current and current != "None (use fixed 90 mm offset below L5)":
+            idx = self.inferiorSegCombo.findText(current)
+            if idx >= 0:
+                self.inferiorSegCombo.setCurrentIndex(idx)
 
     def _populate_vertebrae_list(self, seg_node):
         self.vertebraeList.clear()
@@ -822,22 +898,36 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
             self._run_bulk()
 
     def _run_scene(self):
-        pet_node = self.petSelector.currentNode()
-        ts_node  = self.totalSegSelector.currentNode()
+        pet_node        = self.petSelector.currentNode()
+        generate_ureter = self.generateUreterCheck.isChecked()
+        organ_configs   = self._get_scene_organ_configs()
+        excl_configs    = self._get_excl_configs()
+
         if pet_node is None:
             self.statusLabel.setText("Status: pick a PET volume (Refresh from Scene).")
             return
-        if ts_node is None:
-            self.statusLabel.setText("Status: pick a TotalSeg node (Refresh from Scene).")
-            return
+
+        # TotalSeg + vertebrae are required only when clipping OR ureter generation is on
+        needs_clip    = any(m in ('Clip only', 'Clip + Clean') for _, m in organ_configs)
+        needs_totalseg = generate_ureter or needs_clip
+
+        ts_node   = self.totalSegSelector.currentNode()
         vert_segs = self._get_checked_vertebrae()
-        if not vert_segs:
-            self.statusLabel.setText("Status: check at least one L1-L5 vertebrae segment.")
-            return
-        organ_configs = self._get_scene_organ_configs()
-        if not organ_configs:
+
+        if needs_totalseg and ts_node is None:
             self.statusLabel.setText(
-                "Status: add at least one organ and set its mode (not Skip).")
+                "Status: pick a TotalSeg node "
+                "(required for ureter generation and/or Z-clipping).")
+            return
+        if needs_totalseg and not vert_segs:
+            self.statusLabel.setText(
+                "Status: check at least one L1-L5 vertebrae segment "
+                "(required for ureter generation and/or Z-clipping).")
+            return
+
+        if not organ_configs and not excl_configs:
+            self.statusLabel.setText(
+                "Status: add at least one organ (mode ≠ Skip) or exclusion mask.")
             return
 
         print("\n[SCENE] Mapping:")
@@ -847,7 +937,9 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
         self.statusLabel.setText("Status: running on scene…")
         slicer.app.processEvents()
 
-        excl_configs = self._get_excl_configs()
+        inf_seg_text = self.inferiorSegCombo.currentText
+        inf_seg_name = (None if inf_seg_text.startswith("None")
+                        else inf_seg_text)
 
         try:
             self.logic.run_scene(
@@ -858,10 +950,12 @@ class UreterPostProcessWidget(ScriptedLoadableModuleWidget):
                 max_gap_mm          = self.maxGapSpin.value,
                 fill_holes          = self.fillHolesCheck.isChecked(),
                 pet_node            = pet_node,
-                totalseg_node_name  = ts_node.GetName(),
+                totalseg_node_name  = ts_node.GetName() if ts_node else None,
                 vertebrae_seg_names = vert_segs,
                 organ_configs       = organ_configs,
                 excl_configs        = excl_configs,
+                inf_bound_seg_name  = inf_seg_name,
+                generate_ureter     = generate_ureter,
             )
             self.statusLabel.setText("Status: done — check Segmentations module.")
         except Exception:
@@ -945,22 +1039,33 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
 
     def run_scene(self, suv_thresh, suv_clean_thresh, dilate_mm,
                   pet_node, totalseg_node_name, vertebrae_seg_names, organ_configs,
-                  connect_path=True, max_gap_mm=150.0, fill_holes=True,
-                  excl_configs=None):
+                  connect_path=True, max_gap_mm=35.0, fill_holes=True,
+                  excl_configs=None, inf_bound_seg_name=None,
+                  generate_ureter=True):
         """
-        organ_configs: list of (node_name, mode)
-        excl_configs:  list of dicts {'seg_node', 'seg_name', 'dilate_mm', 'suv_thresh'}
+        organ_configs:   list of (node_name, mode)
+        excl_configs:    list of dicts {'seg_node','seg_name','dilate_mm','suv_thresh'}
+        generate_ureter: False → skip ureter mask entirely; clean steps are no-ops,
+                         clipping and exclusion masks still work normally.
         Outputs one '<node>_processed' segmentation node per organ.
         """
         print("\n" + "="*60)
-        print("SCENE MODE")
+        print("SCENE MODE" + ("" if generate_ureter else "  [ureter mask OFF]"))
         print("="*60)
 
         pet_arr, pet_affine, pet_mat, vox_size = self._get_pet(pet_node)
-        z_inferior, z_superior = self._get_l1l5_z_bounds(
-            vertebrae_seg_names, totalseg_node_name=totalseg_node_name)
 
-        needs_ureter = any(m in ('Clean only', 'Clip + Clean') for _, m in organ_configs)
+        # Z bounds — only needed for clipping or ureter mask construction
+        needs_clip   = any(m in ('Clip only', 'Clip + Clean') for _, m in organ_configs)
+        needs_ureter = generate_ureter and any(
+            m in ('Clean only', 'Clip + Clean') for _, m in organ_configs)
+        needs_z      = needs_clip or needs_ureter
+
+        z_inferior = z_superior = None
+        if needs_z and totalseg_node_name and vertebrae_seg_names:
+            z_inferior, z_superior = self._get_l1l5_z_bounds(
+                vertebrae_seg_names, totalseg_node_name=totalseg_node_name)
+
         ureter_arr = ureter_affine = None
         if needs_ureter:
             ureter_arr, ureter_affine = self._build_ureter_mask(
@@ -971,7 +1076,10 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
                 connect_path=connect_path,
                 max_gap_mm=max_gap_mm,
                 fill_holes=fill_holes,
+                inf_bound_seg_name=inf_bound_seg_name,
             )
+        elif not generate_ureter:
+            print("[URETER] Ureter mask generation disabled — clean steps will be skipped.")
 
         for organ_name, mode in organ_configs:
             self._process_organ_scene(
@@ -990,7 +1098,7 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
 
     def run_bulk(self, dataset_clean_root, suv_thresh, suv_clean_thresh,
                  dilate_mm, skip_done,
-                 connect_path=True, max_gap_mm=150.0, fill_holes=True,
+                 connect_path=True, max_gap_mm=35.0, fill_holes=True,
                  vertebrae_seg_names=None,
                  totalseg_file='TotalSeg_abdomen.seg.nrrd',
                  organ_file_configs=None,
@@ -1215,31 +1323,37 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
         import numpy as np
 
         if mode in ('Clip only', 'Clip + Clean'):
-            print(f"[ORGAN]   Clipping to L1-L5 Z ({z_inferior:.1f}–{z_superior:.1f} mm)…")
-            shape = organ_arr.shape
-            z_idx, y_idx, x_idx = np.meshgrid(
-                np.arange(shape[0]), np.arange(shape[1]), np.arange(shape[2]),
-                indexing='ij')
-            ijk_hom = np.stack([
-                x_idx.ravel(), y_idx.ravel(), z_idx.ravel(),
-                np.ones(x_idx.size)], axis=1).astype(np.float32)
-            ras_z = (organ_affine @ ijk_hom.T).T[:, 2].reshape(shape)
-            outside = (ras_z < z_inferior) | (ras_z > z_superior)
-            clipped = int(((organ_arr > 0) & outside).sum())
-            organ_arr[outside] = 0
-            print(f"[ORGAN]   Clipped {clipped} voxels outside L1-L5")
+            if z_inferior is None or z_superior is None:
+                print("[ORGAN]   Z bounds not available — clip step skipped")
+            else:
+                print(f"[ORGAN]   Clipping to L1-L5 Z ({z_inferior:.1f}–{z_superior:.1f} mm)…")
+                shape = organ_arr.shape
+                z_idx, y_idx, x_idx = np.meshgrid(
+                    np.arange(shape[0]), np.arange(shape[1]), np.arange(shape[2]),
+                    indexing='ij')
+                ijk_hom = np.stack([
+                    x_idx.ravel(), y_idx.ravel(), z_idx.ravel(),
+                    np.ones(x_idx.size)], axis=1).astype(np.float32)
+                ras_z = (organ_affine @ ijk_hom.T).T[:, 2].reshape(shape)
+                outside = (ras_z < z_inferior) | (ras_z > z_superior)
+                clipped = int(((organ_arr > 0) & outside).sum())
+                organ_arr[outside] = 0
+                print(f"[ORGAN]   Clipped {clipped} voxels outside L1-L5")
 
         if mode in ('Clean only', 'Clip + Clean'):
-            print(f"[ORGAN]   Removing ureter-overlapping voxels "
-                  f"(SUV>{suv_clean_thresh})…")
-            ureter_in = self._resample_to_target(
-                ureter_arr, ureter_affine, organ_arr.shape, organ_affine)
-            pet_in = self._resample_to_target(
-                pet_arr, pet_affine, organ_arr.shape, organ_affine)
-            remove = ((organ_arr > 0) & (ureter_in > 0) & (pet_in > suv_clean_thresh))
-            cleaned = int(remove.sum())
-            organ_arr[remove] = 0
-            print(f"[ORGAN]   Removed {cleaned} ureter-overlap voxels")
+            if ureter_arr is None:
+                print("[ORGAN]   Ureter mask not available — ureter clean step skipped")
+            else:
+                print(f"[ORGAN]   Removing ureter-overlapping voxels "
+                      f"(SUV>{suv_clean_thresh})…")
+                ureter_in = self._resample_to_target(
+                    ureter_arr, ureter_affine, organ_arr.shape, organ_affine)
+                pet_in = self._resample_to_target(
+                    pet_arr, pet_affine, organ_arr.shape, organ_affine)
+                remove = ((organ_arr > 0) & (ureter_in > 0) & (pet_in > suv_clean_thresh))
+                cleaned = int(remove.sum())
+                organ_arr[remove] = 0
+                print(f"[ORGAN]   Removed {cleaned} ureter-overlap voxels")
 
         return organ_arr
 
@@ -1293,8 +1407,9 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
     def _build_ureter_mask(self, pet_arr, pet_affine, pet_mat, vox_size,
                             z_inferior, z_superior, suv_thresh, dilate_mm,
                             seg_node_name, totalseg_node_name=None,
-                            connect_path=True, max_gap_mm=150.0, fill_holes=True,
-                            ureter_ext_inf_mm=200.0, torso_radius_mm=220.0):
+                            connect_path=True, max_gap_mm=35.0, fill_holes=True,
+                            inf_bound_seg_name=None,
+                            ureter_ext_inf_mm=90.0, torso_radius_mm=220.0):
         """
         Build the ureter exclusion mask from PET.
 
@@ -1309,9 +1424,23 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
         import numpy as np
         from scipy import ndimage
 
-        # Extended Z bounds: kidneys (above L1) → bladder (below L5)
-        ureter_z_sup = z_superior + 50.0
-        ureter_z_inf = z_inferior - ureter_ext_inf_mm
+        # Upper Z bound: top of L1 (no upward extension beyond the vertebrae)
+        ureter_z_sup = z_superior
+
+        if inf_bound_seg_name and totalseg_node_name:
+            try:
+                seg_z_min, seg_z_max = self._segment_ras_z_bounds(
+                    totalseg_node_name, inf_bound_seg_name)
+                ureter_z_inf = seg_z_min   # inferior border of sacrum
+                print(f"\n[URETER] Inferior boundary from '{inf_bound_seg_name}': "
+                      f"Z_inf set to {ureter_z_inf:.1f} mm (inferior border of segment)")
+            except Exception as e:
+                print(f"[URETER] WARNING: could not use '{inf_bound_seg_name}' as "
+                      f"inferior boundary ({e}) — falling back to fixed offset.")
+                ureter_z_inf = z_inferior - ureter_ext_inf_mm
+        else:
+            ureter_z_inf = z_inferior - ureter_ext_inf_mm
+
         print(f"\n[URETER] SUV>{suv_thresh}  dilation={dilate_mm}mm")
         print(f"[URETER] Z range: {ureter_z_inf:.1f} -> {ureter_z_sup:.1f} mm RAS "
               f"(L1-L5 was {z_inferior:.1f} -> {z_superior:.1f})")
@@ -1390,6 +1519,16 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
                     ureter_mask[z] = binary_fill_holes(ureter_mask[z]).astype(np.uint8)
             print(f"[URETER] Fill holes: {before_fh} → {int(ureter_mask.sum())} voxels")
 
+        # ── Hard Z clip AFTER all processing ──────────────────────────────────
+        # Dilation (and gap-bridging) can push voxels past the Z bounds set
+        # above.  Re-apply the same Z mask as a strict post-processing clamp
+        # so the final mask never exceeds the L1 top / sacrum bottom limits.
+        before_clip = int(ureter_mask.sum())
+        ureter_mask = (ureter_mask & z_mask).astype(np.uint8)
+        print(f"[URETER] Post-dilation Z clip: {before_clip} → "
+              f"{int(ureter_mask.sum())} voxels "
+              f"(Z {ureter_z_inf:.1f} → {ureter_z_sup:.1f} mm enforced)")
+
         lm_name = seg_node_name + '_lm'
         self._remove_existing(lm_name)
         lm = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLLabelMapVolumeNode', lm_name)
@@ -1407,7 +1546,7 @@ class UreterPostProcessLogic(ScriptedLoadableModuleLogic):
 
     # ── Ureter connectivity (pure vertical cylinder) ──────────────────────────
 
-    def _connect_ureter_path(self, mask_arr, vox_size, max_gap_mm=150.0, tube_radius_vox=3):
+    def _connect_ureter_path(self, mask_arr, vox_size, max_gap_mm=35.0, tube_radius_vox=3):
         """
         Bridge gaps between adjacent disconnected ureter fragments.
 
