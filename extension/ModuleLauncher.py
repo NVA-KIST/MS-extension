@@ -36,13 +36,6 @@ _MODULES = [
         'color':        '#2e7d32',
     },
     {
-        'import_name':  'TotalSegmentatorAdvanced',
-        'class_name':   'TotalSegmentatorAdvancedWidget',
-        'display_name': 'TotalSegmentator Advanced',
-        'description':  'Run TotalSegmentator with task + structure selection.',
-        'color':        '#1565c0',
-    },
-    {
         'import_name':  'SegmentDilator',
         'class_name':   'SegmentDilatorWidget',
         'display_name': 'Segment Dilator',
@@ -55,6 +48,27 @@ _MODULES = [
         'display_name': 'Distance Measurer',
         'description':  'Place ruler lines and measure distances in mm / cm / voxels.',
         'color':        '#e65100',
+    },
+    {
+        'import_name':  'PETHotspotNavigator',
+        'class_name':   'PETHotspotNavigatorWidget',
+        'display_name': 'PET Hotspot Navigator',
+        'description':  'Locate the highest-SUV voxel in every segment and jump to it.',
+        'color':        '#ad1457',
+    },
+    {
+        'import_name':  'ScribbleTool',
+        'class_name':   'ScribbleToolWidget',
+        'display_name': 'Scribble Tool',
+        'description':  'Draw freehand strokes and place text labels on any slice view.',
+        'color':        '#4527a0',
+    },
+    {
+        'import_name':  'VesselSegmenter',
+        'class_name':   'VesselSegmenterWidget',
+        'display_name': 'Vessel Segmenter',
+        'description':  'Segment large vessels (femoral/iliac) using PET blood-pool signal + seed points.',
+        'color':        '#00695c',
     },
 ]
 
@@ -180,10 +194,15 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
                 windowTitle="Module Launcher")
             return
 
-        # Instantiate with parent=None so the widget creates its own
-        # qMRMLWidget container, which we then dress up as a window.
+        # Create the parent widget ourselves and pass it in.
+        # This prevents ScriptedLoadableModuleWidget.__init__ from
+        # auto-calling setup() (which some Slicer versions do when
+        # parent=None), so setup() runs exactly once — when we call it.
         try:
-            instance = widget_cls(None)
+            parent_widget = slicer.qMRMLWidget()
+            parent_widget.setLayout(qt.QVBoxLayout())
+            parent_widget.setMRMLScene(slicer.mrmlScene)
+            instance = widget_cls(parent_widget)
             instance.setup()
         except Exception as e:
             import traceback
@@ -192,7 +211,7 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
                 windowTitle="Module Launcher")
             return
 
-        window = instance.parent
+        window = parent_widget
         window.setWindowTitle(display_name)
         window.setWindowFlags(qt.Qt.Window)   # independent, re-sizable window
         window.setMinimumWidth(460)
