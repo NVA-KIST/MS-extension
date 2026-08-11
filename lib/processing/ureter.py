@@ -78,7 +78,7 @@ def build_ureter_mask_from_pet(
     torso_center_xy: Tuple[float, float],
     *,
     ureter_z_inf: Optional[float] = None,
-    ureter_ext_inf_mm: float = 90.0,
+    ureter_ext_inf_mm: float = 50.0,
     torso_radius_mm: float = 220.0,
     connect_path: bool = True,
     max_gap_mm: float = 35.0,

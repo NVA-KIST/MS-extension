@@ -28,6 +28,24 @@ TARGET_EXTRA_ROIS = [
     "spleen",
 ]
 
+# Abdomen group organs (packed into abdomen.seg.nrrd)
+ABDOMEN_ROIS = [
+    "liver",
+    "spleen",
+    "pancreas",
+    "kidney_right",
+    "kidney_left",
+    "gallbladder",
+    "adrenal_gland_right",
+    "adrenal_gland_left",
+    # Hollow / GI
+    "urinary_bladder",
+    "small_bowel",
+    "colon",
+    "duodenum",
+    "stomach",
+]
+
 VESSEL_ROIS = [
     "aorta",
     "iliac_artery_left", "iliac_artery_right",
@@ -142,14 +160,15 @@ def run_totalseg_for_visceral_fat(
     device: str = "gpu",
     include_targets: bool = True,
     include_vessels: bool = True,
+    include_abdomen: bool = True,
     use_api: bool = True,
     log=None,
 ) -> Path:
     """
-    Run the TS tasks needed for VF + target organs + optional vessels.
+    Run the TS tasks needed for VF + target organs + abdomen + optional vessels.
 
     Tasks:
-      1. total  (ROI subset: VF anatomy + optional psoas/spleen/vessels)
+      1. total  (ROI subset: VF anatomy + psoas/spleen + abdomen + vessels)
       2. body   → body_trunc
       3. tissue_types → torso_fat  (needs academic licence)
     """
@@ -165,6 +184,8 @@ def run_totalseg_for_visceral_fat(
     rois = list(VF_TOTAL_ROIS)
     if include_targets:
         rois.extend(TARGET_EXTRA_ROIS)
+    if include_abdomen:
+        rois.extend(ABDOMEN_ROIS)
     if include_vessels:
         rois.extend(VESSEL_ROIS)
     # unique preserve order

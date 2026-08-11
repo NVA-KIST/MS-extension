@@ -95,6 +95,7 @@ def process_one(
     skip_ts: bool = False,
     skip_vf: bool = False,
     package_nrrd: bool = True,
+    cleanup_loose: bool = True,
     auto_orient: bool = True,
 ) -> dict:
     seg_dir.mkdir(parents=True, exist_ok=True)
@@ -134,10 +135,15 @@ def process_one(
 
     if package_nrrd:
         print("\n=== Packaging .seg.nrrd ===")
-        written = package_patient_segmentations(str(seg_dir), str(ct_nii))
+        written = package_patient_segmentations(
+            str(seg_dir), str(ct_nii), cleanup_loose=cleanup_loose
+        )
         result["seg_nrrd"] = written
         for k, v in written.items():
-            print(f"  {k}: {v}")
+            if k == "cleaned_loose_files":
+                print(f"  cleaned loose intermediates: {v}")
+            else:
+                print(f"  {k}: {v}")
 
     return result
 
@@ -158,6 +164,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--skip-ts", action="store_true", help="Skip TotalSegmentator")
     p.add_argument("--skip-vf", action="store_true", help="Skip VF inference")
     p.add_argument("--no-nrrd", action="store_true", help="Skip .seg.nrrd packaging")
+    p.add_argument(
+        "--keep-loose",
+        action="store_true",
+        help="Keep intermediate anatomy/body NIfTIs after packaging (default: delete them)",
+    )
     p.add_argument("--no-auto-orient", action="store_true", help="Disable 4-flip search")
     p.add_argument("--limit", type=int, default=0, help="Process at most N patients")
     args = p.parse_args(argv)
@@ -185,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
             skip_ts=args.skip_ts,
             skip_vf=args.skip_vf,
             package_nrrd=not args.no_nrrd,
+            cleanup_loose=not args.keep_loose,
             auto_orient=not args.no_auto_orient,
         )
         print("\nDone.")
@@ -215,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
                 skip_ts=args.skip_ts,
                 skip_vf=args.skip_vf,
                 package_nrrd=not args.no_nrrd,
+                cleanup_loose=not args.keep_loose,
                 auto_orient=not args.no_auto_orient,
             )
         except Exception as e:

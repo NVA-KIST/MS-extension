@@ -51,9 +51,14 @@ def subtract_dilated_union(
     tgt_arr: np.ndarray,
     tgt_affine,
     dilated_items: Sequence[tuple],
+    *,
+    same_grid_items: Sequence[np.ndarray] | None = None,
 ) -> np.ndarray:
     """
-    Subtract union of dilated sources (each (arr, affine)) from target mask.
+    Subtract union of dilated sources from target mask.
+
+    ``dilated_items`` are ``(arr, affine)`` pairs resampled into target space.
+    ``same_grid_items`` are masks already on the target voxel grid (no resample).
     Returns a copy of tgt with overlapping voxels zeroed.
     """
     tgt_arr = np.asarray(tgt_arr)
@@ -61,6 +66,14 @@ def subtract_dilated_union(
     for src_arr, src_affine in dilated_items:
         resampled = resample_to_target(src_arr, src_affine, tgt_arr.shape, tgt_affine)
         union = np.maximum(union, (resampled > 0).astype(np.uint8))
+    if same_grid_items:
+        for src_arr in same_grid_items:
+            src_arr = np.asarray(src_arr)
+            if src_arr.shape != tgt_arr.shape:
+                raise ValueError(
+                    f"same_grid mask shape {src_arr.shape} != target {tgt_arr.shape}"
+                )
+            union = np.maximum(union, (src_arr > 0).astype(np.uint8))
     result = tgt_arr.copy()
     result[(result > 0) & (union > 0)] = 0
     return result

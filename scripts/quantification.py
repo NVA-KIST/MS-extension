@@ -14,11 +14,15 @@ Inject a dataset root and output Excel path — no Slicer required::
         --segments visceral_fat,spleen,iliopsoas_left,iliopsoas_right ^
         --radiomics
 
+With ``--radiomics``, the workbook gets two content sheets:
+  - Quantification  (SUV mean/max/peak, volume, TLG)
+  - Radiomics       (selected PyRadiomics features)
+plus a Summary pivot of Quantification metrics.
+
 Prefers ``*_processed.nii.gz`` masks when present (postprocessing output).
 
-Slicer equivalent: PETCTQuantAnalysis / PETBiomarkerStudio batch.
-  - CLI uses pure-numpy SUV mean/max/peak/volume/TLG (and PyRadiomics).
-  - Slicer UI can still use QuantitativeIndicesCLI for PETindic peak definition.
+Slicer equivalent: PETBiomarkerStudio / PETCTQuantAnalysis batch
+(same Quantification + Radiomics sheet layout).
 """
 from __future__ import annotations
 
@@ -49,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         "--out",
         type=Path,
         required=True,
-        help="Output .xlsx path",
+        help="Output .xlsx path (Quantification + Radiomics sheets when --radiomics)",
     )
     p.add_argument(
         "--segments",
@@ -63,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--radiomics",
         action="store_true",
-        help="Also extract the 8 BiomarkerStudio radiomics features",
+        help="Also extract radiomics into a separate 'Radiomics' sheet",
     )
     p.add_argument("--bin-width", type=float, default=0.25)
     args = p.parse_args(argv)
@@ -75,6 +79,10 @@ def main(argv: list[str] | None = None) -> int:
             "selected_feature_keys": list(SELECTED_RADIOMICS_FEATURE_ORDER),
             "bin_width": args.bin_width,
             "derived": True,
+            # Large ROIs (VF) OOM at native PET resolution without this
+            "resample_isotropic": True,
+            "resampled_spacing_mm": 4.0,
+            "auto_resample_large": True,
         }
 
     summary = run_batch_quantification(
@@ -92,6 +100,10 @@ def main(argv: list[str] | None = None) -> int:
         f"errors={summary['errors']} rows={summary['rowCount']}"
     )
     print(f"Excel: {summary['savedPath']}")
+    if args.radiomics:
+        print("Sheets: Quantification + Radiomics (+ Summary pivot)")
+    else:
+        print("Sheets: Quantification (+ Summary pivot)")
     return 0 if summary["errors"] == 0 else 2
 
 

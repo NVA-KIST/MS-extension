@@ -10,6 +10,7 @@ from lib.quantification.biomarker_batch import (
     is_auxiliary_segment_stem,
     parse_batch_base_name,
     parse_quantitative_indices_results,
+    resolve_batch_segment_file,
     safe_asymmetry,
     save_batch_rows_to_excel,
     save_qc_rows_to_excel,
@@ -27,6 +28,7 @@ from lib.quantification.pet_metrics import (
     error_row,
     run_batch_quantification,
     save_excel,
+    suvbw_factor_from_dicom_folder,
 )
 from lib.quantification.radiomics import (
     extract_radiomics_from_paths,
@@ -40,6 +42,7 @@ __all__ = [
     "format_distance",
     "ras_distance_to_voxels",
     "compute_suvbw_factor",
+    "suvbw_factor_from_dicom_folder",
     "error_row",
     "save_excel",
     "compute_segment_metrics",
@@ -54,6 +57,7 @@ __all__ = [
     "parse_batch_base_name",
     "scan_batch_dataset",
     "find_batch_segment_file",
+    "resolve_batch_segment_file",
     "existing_batch_keys",
     "segment_role",
     "safe_asymmetry",

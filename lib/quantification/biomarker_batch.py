@@ -33,6 +33,9 @@ def default_excel_label(stem: str) -> str:
     for suffix in (".seg",):
         if label.lower().endswith(suffix):
             label = label[: -len(suffix)]
+    # Keep Excel segment names stable whether raw or *_processed was used
+    if label.lower().endswith("_processed"):
+        label = label[: -len("_processed")]
     return label
 
 
@@ -93,6 +96,66 @@ def find_batch_segment_file(seg_dir: str, stem: str) -> Optional[str]:
     return None
 
 
+def resolve_batch_segment_file(
+    seg_dir: str,
+    stem: str,
+    *,
+    prefer_processed: bool = True,
+    processed_suffix: str = "_processed",
+) -> Optional[str]:
+    """
+    Resolve a mask path for quantification.
+
+    If ``prefer_processed`` and ``{stem}_processed`` exists, use that;
+    otherwise fall back to ``stem``. Stems that already end with the
+    processed suffix are used as-is.
+    """
+    stem = str(stem).replace(".nii.gz", "").replace(".nii", "").strip()
+    if not stem:
+        return None
+    candidates: list[str] = []
+    already_processed = stem.lower().endswith(processed_suffix.lower())
+    if prefer_processed and not already_processed:
+        candidates.append(stem + processed_suffix)
+    candidates.append(stem)
+    for cand in candidates:
+        hit = find_batch_segment_file(seg_dir, cand)
+        if hit:
+            return hit
+    return None
+
+
+QUANTIFICATION_SHEET = "Quantification"
+RADIOMICS_SHEET = "Radiomics"
+# Legacy sheet name used before Quantification/Radiomics split
+LEGACY_DATA_SHEET = "Data"
+
+QUANTIFICATION_BASE_COLS = [
+    "subject_id", "patient_id", "scan_date", "segment", "source_file",
+    "volume_mL", "suv_mean", "suv_max", "suv_peak", "tlg",
+    "radiomics_status", "computation_signature", "status", "computed_at",
+]
+
+RADIOMICS_META_COLS = [
+    "subject_id", "patient_id", "scan_date", "segment", "source_file",
+    "radiomics_status", "computation_signature", "status", "computed_at",
+]
+
+
+def is_radiomics_column(name: Any) -> bool:
+    return str(name).startswith("rad_")
+
+
+def quantification_sheet_name(sheetnames: Sequence[str]) -> Optional[str]:
+    """Prefer Quantification; fall back to legacy Data."""
+    names = list(sheetnames)
+    if QUANTIFICATION_SHEET in names:
+        return QUANTIFICATION_SHEET
+    if LEGACY_DATA_SHEET in names:
+        return LEGACY_DATA_SHEET
+    return None
+
+
 def existing_batch_keys(
     output_file: str,
     required_segments: Optional[Sequence[str]] = None,
@@ -110,7 +173,8 @@ def existing_batch_keys(
         wb = openpyxl.load_workbook(output_file, read_only=True)
     except Exception:
         return keys
-    if "Data" not in wb.sheetnames:
+    sheet = quantification_sheet_name(wb.sheetnames)
+    if sheet is None:
         return keys
 
     requested = {
@@ -118,7 +182,7 @@ def existing_batch_keys(
         if str(segment).strip()
     }
     completed: Dict[Tuple[str, str], Set[str]] = {}
-    ws = wb["Data"]
+    ws = wb[sheet]
     header = None
     for row in ws.iter_rows(values_only=True):
         if header is None:
@@ -145,6 +209,27 @@ def existing_batch_keys(
             keys.add(key)
     return keys
 
+
+def split_quant_and_radiomics_row(row: dict) -> Tuple[dict, dict]:
+    """Split one combined result dict into quantification + radiomics dicts."""
+    quant = {
+        k: v for k, v in row.items()
+        if not is_radiomics_column(k)
+    }
+    rad = {
+        k: row.get(k, "")
+        for k in RADIOMICS_META_COLS
+    }
+    for k, v in row.items():
+        if is_radiomics_column(k):
+            rad[k] = v
+    return quant, rad
+
+
+def row_has_radiomics(row: dict) -> bool:
+    if any(is_radiomics_column(k) for k in row.keys()):
+        return True
+    return str(row.get("radiomics_status", "")).strip().lower() == "done"
 
 def _normalise_segment_label(label: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(label).lower())
@@ -337,12 +422,79 @@ def parse_quantitative_indices_results(
     return results
 
 
+def _append_rows_to_sheet(wb, sheet_name: str, rows: Sequence[dict], base_cols: list[str]) -> None:
+    """Create/append a sheet with schema merge; never keep rad_* on Quantification."""
+    extra_cols: list[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key in base_cols or key in extra_cols:
+                continue
+            if sheet_name == QUANTIFICATION_SHEET and is_radiomics_column(key):
+                continue
+            if sheet_name == RADIOMICS_SHEET and key not in RADIOMICS_META_COLS and not is_radiomics_column(key):
+                continue
+            extra_cols.append(key)
+
+    if sheet_name == RADIOMICS_SHEET:
+        current_cols = list(dict.fromkeys(
+            RADIOMICS_META_COLS[:-2]
+            + sorted(c for c in extra_cols if is_radiomics_column(c))
+            + RADIOMICS_META_COLS[-2:]
+        ))
+    else:
+        # status / computed_at last
+        current_cols = list(dict.fromkeys(
+            [c for c in base_cols if c not in ("status", "computed_at")]
+            + sorted(extra_cols)
+            + ["status", "computed_at"]
+        ))
+
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        existing_header = [
+            ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)
+        ]
+        existing_header = [
+            str(h).strip() for h in existing_header
+            if h is not None and str(h).strip() != ""
+        ]
+        if sheet_name == QUANTIFICATION_SHEET:
+            existing_header = [h for h in existing_header if not is_radiomics_column(h)]
+        data_cols = list(dict.fromkeys(existing_header + current_cols))
+    else:
+        if (
+            sheet_name == QUANTIFICATION_SHEET
+            and wb.active
+            and wb.active.title in ("Sheet", "Results", LEGACY_DATA_SHEET)
+            and LEGACY_DATA_SHEET not in wb.sheetnames
+            and QUANTIFICATION_SHEET not in wb.sheetnames
+        ):
+            ws = wb.active
+            ws.title = sheet_name
+        else:
+            ws = wb.create_sheet(sheet_name)
+        data_cols = list(dict.fromkeys(current_cols))
+        for ci, col in enumerate(data_cols, 1):
+            ws.cell(row=1, column=ci, value=col)
+
+    for ci, col in enumerate(data_cols, 1):
+        ws.cell(row=1, column=ci, value=col)
+    for row in rows:
+        ws.append([row.get(c, "") for c in data_cols])
+
+
 def save_batch_rows_to_excel(
     rows: Sequence[dict],
     output_file: str,
     append: bool = True,
 ) -> str:
-    """Write Data + rebuilt Summary sheets (schema-merged on append)."""
+    """
+    Write Quantification (+ optional Radiomics) sheets, then rebuild Summary.
+
+    SUV / volume / TLG go to ``Quantification``.
+    ``rad_*`` features go to ``Radiomics`` (created only when radiomics ran).
+    ``Summary`` is a subject×segment pivot of Quantification metrics only.
+    """
     if not rows:
         raise ValueError("No batch rows to save.")
     output_file = os.path.abspath(output_file)
@@ -357,54 +509,46 @@ def save_batch_rows_to_excel(
             "Install with: pip install openpyxl"
         ) from e
 
-    base_cols = [
-        "subject_id", "patient_id", "scan_date", "segment", "source_file",
-        "volume_mL", "suv_mean", "suv_max", "suv_peak", "tlg",
-        "radiomics_status", "computation_signature", "status", "computed_at",
-    ]
-    extra_cols = []
-    for row in rows:
-        for key in row.keys():
-            if key not in base_cols and key not in extra_cols:
-                extra_cols.append(key)
-    current_cols = base_cols[:-2] + sorted(extra_cols) + base_cols[-2:]
-
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    quant_rows: list[dict] = []
+    rad_rows: list[dict] = []
     for row in rows:
+        row = dict(row)
         row.setdefault("computed_at", now)
+        quant, rad = split_quant_and_radiomics_row(row)
+        quant_rows.append(quant)
+        if row_has_radiomics(row):
+            rad_rows.append(rad)
 
     if append and os.path.isfile(output_file):
         wb = openpyxl.load_workbook(output_file)
         for stale in ("Sheet", "Sheet1", "Results"):
             if stale in wb.sheetnames:
                 del wb[stale]
+        # Migrate legacy "Data" → "Quantification"
+        if (
+            LEGACY_DATA_SHEET in wb.sheetnames
+            and QUANTIFICATION_SHEET not in wb.sheetnames
+        ):
+            wb[LEGACY_DATA_SHEET].title = QUANTIFICATION_SHEET
     else:
         wb = openpyxl.Workbook()
 
-    if "Data" in wb.sheetnames:
-        ws = wb["Data"]
-        existing_header = [
-            ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)
-        ]
-        existing_header = [
-            str(h).strip() for h in existing_header
-            if h is not None and str(h).strip() != ""
-        ]
-        data_cols = list(dict.fromkeys(existing_header + current_cols))
-    else:
-        if wb.active and wb.active.title in ("Sheet", "Results"):
-            ws = wb.active
-            ws.title = "Data"
-        else:
-            ws = wb.create_sheet("Data", 0)
-        data_cols = list(dict.fromkeys(current_cols))
+    _append_rows_to_sheet(
+        wb, QUANTIFICATION_SHEET, quant_rows, QUANTIFICATION_BASE_COLS
+    )
+    if rad_rows:
+        _append_rows_to_sheet(
+            wb, RADIOMICS_SHEET, rad_rows, RADIOMICS_META_COLS
+        )
 
-    for ci, col in enumerate(data_cols, 1):
-        ws.cell(row=1, column=ci, value=col)
-    for row in rows:
-        ws.append([row.get(c, "") for c in data_cols])
-
-    header = [ws.cell(row=1, column=c).value for c in range(1, len(data_cols) + 1)]
+    # Rebuild Summary from Quantification only
+    ws = wb[QUANTIFICATION_SHEET]
+    data_cols = [
+        ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)
+    ]
+    data_cols = [c for c in data_cols if c is not None]
+    header = data_cols
     all_data = []
     for r in range(2, ws.max_row + 1):
         vals = [ws.cell(row=r, column=c).value for c in range(1, len(data_cols) + 1)]
@@ -417,7 +561,6 @@ def save_batch_rows_to_excel(
     metric_cols = [
         c for c in data_cols
         if c in ("volume_mL", "suv_mean", "suv_max", "suv_peak", "tlg")
-        or str(c).startswith("rad_")
     ]
     seen_segs = list(dict.fromkeys(
         str(r.get("segment", "")).strip()

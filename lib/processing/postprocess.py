@@ -14,10 +14,11 @@ from typing import Iterable, Optional, Sequence
 
 import numpy as np
 
-from lib.processing.dilate import dilate_mask, subtract_dilated_union
+from lib.processing.dilate import dilate_mask, resample_to_target, subtract_dilated_union
 from lib.processing.ureter import (
     apply_organ_processing,
     build_ureter_mask_from_pet,
+    clip_organ_to_z,
     z_bounds_from_mask,
 )
 
@@ -33,6 +34,22 @@ ORGAN_MODES = (
     "Clean only",
     "Clip + Clean",
     "Skip",
+)
+
+# ── KU protocol defaults (ureter + group subtract/clean) ─────────────────────
+URETER_SUV_THRESH = 2.5
+URETER_DILATE_MM = 18.0
+URETER_EXT_INF_MM = 50.0
+URETER_TORSO_RADIUS_MM = 220.0
+GROUP_SUBTRACT_DILATE_MM = 5.0
+CLEAN_EXCLUDE_DILATE_MM = 13.0
+SUV_CLEAN_FAT = 1.2
+SUV_CLEAN_PSOAS = 1.6
+
+GROUP_SEGNRRD_FILES = (
+    "abdomen.seg.nrrd",
+    "vessels.seg.nrrd",
+    "spine.seg.nrrd",
 )
 
 # Filenames / tokens that are usually not target quantification organs
@@ -236,6 +253,525 @@ def load_pet_array(
     raise FileNotFoundError("No PET NIfTI or DICOM folder available")
 
 
+def _sitk_affine_ras(img) -> np.ndarray:
+    """SimpleITK image → 4x4 affine mapping index (i,j,k) → physical RAS-ish."""
+    spacing = np.asarray(img.GetSpacing(), dtype=np.float64)
+    origin = np.asarray(img.GetOrigin(), dtype=np.float64)
+    direction = np.asarray(img.GetDirection(), dtype=np.float64).reshape(3, 3)
+    affine = np.eye(4, dtype=np.float64)
+    affine[:3, :3] = direction @ np.diag(spacing)
+    affine[:3, 3] = origin
+    return affine
+
+
+def _guess_pet_nii(seg_dir: Path) -> Optional[Path]:
+    """Locate ``<subject>_PET.nii.gz`` next to ``Segments/<subject>_Seg``."""
+    stem = seg_dir.name.replace("_Seg", "")
+    root = seg_dir.parent.parent
+    for sub in ("PET_NIfTI", "PET"):
+        p = root / sub / f"{stem}_PET.nii.gz"
+        if p.is_file():
+            return p
+    return None
+
+
+def _resolve_ref_nii(seg_dir: Path, organ_list: Sequence[str]) -> Path:
+    """CT-grid reference NIfTI (prefer visceral fat) for group / exclusion alignment."""
+    candidates = ["visceral_fat.nii.gz"]
+    for name in organ_list:
+        n = str(name)
+        if not (n.endswith(".nii.gz") or n.endswith(".nii")):
+            n = n + ".nii.gz"
+        if n not in candidates:
+            candidates.append(n)
+    for name in candidates:
+        p = seg_dir / name
+        if p.is_file():
+            return p
+    raise FileNotFoundError(
+        f"No reference organ NIfTI in {seg_dir} (tried {', '.join(candidates)})"
+    )
+
+
+def _resample_image_to_nifti_ref(moving_path: str | Path, ref_nii_path: str | Path) -> np.ndarray:
+    """Resample any SimpleITK-readable mask onto a NIfTI reference grid (ZYX uint8)."""
+    import SimpleITK as sitk
+
+    ref = sitk.ReadImage(str(ref_nii_path))
+    moving = sitk.ReadImage(str(moving_path))
+    out = sitk.Resample(
+        moving,
+        ref,
+        sitk.Transform(),
+        sitk.sitkNearestNeighbor,
+        0,
+        moving.GetPixelID(),
+    )
+    return (sitk.GetArrayFromImage(out) > 0).astype(np.uint8)
+
+
+def _segnrrd_union_on_ref_excluding(
+    segnrrd_path: str | Path,
+    ref_nii_path: str | Path,
+    exclude_names: Sequence[str],
+) -> np.ndarray:
+    """Load a ``.seg.nrrd``, drop named segments, resample union onto ref NIfTI grid."""
+    import SimpleITK as sitk
+
+    exclude = {str(n).strip() for n in exclude_names}
+    img = sitk.ReadImage(str(segnrrd_path))
+    arr = sitk.GetArrayFromImage(img)
+    drop_labels: list[int] = []
+    i = 0
+    while img.HasMetaDataKey(f"Segment{i}_Name"):
+        name = str(img.GetMetaData(f"Segment{i}_Name")).strip()
+        if name in exclude:
+            if img.HasMetaDataKey(f"Segment{i}_LabelValue"):
+                drop_labels.append(int(float(img.GetMetaData(f"Segment{i}_LabelValue"))))
+            else:
+                drop_labels.append(i + 1)
+        i += 1
+    for lab in drop_labels:
+        arr = np.where(arr == lab, 0, arr)
+    tmp = sitk.GetImageFromArray(arr.astype(np.uint8))
+    tmp.CopyInformation(img)
+    ref = sitk.ReadImage(str(ref_nii_path))
+    out = sitk.Resample(
+        tmp,
+        ref,
+        sitk.Transform(),
+        sitk.sitkNearestNeighbor,
+        0,
+        sitk.sitkUInt8,
+    )
+    return (sitk.GetArrayFromImage(out) > 0).astype(np.uint8)
+
+
+# Organs that also appear inside abdomen.seg.nrrd — exclude from self-subtraction
+SELF_EXCLUDE_FROM_ABDOMEN = {
+    "spleen": ("spleen",),
+}
+
+
+def _group_dilated_for_subtract(
+    seg_dir: Path,
+    ref_nii_path: Path,
+    ref_aff,
+    dilate_mm: float,
+    organ_stem: str,
+) -> list[np.ndarray]:
+    """5 mm dilated abdomen/vessels/spine masks for hard-subtract (skip self for spleen)."""
+    exclude = SELF_EXCLUDE_FROM_ABDOMEN.get(organ_stem.lower(), ())
+    dilated: list[np.ndarray] = []
+    for name in GROUP_SEGNRRD_FILES:
+        path = seg_dir / name
+        if not path.is_file():
+            continue
+        if name == "abdomen.seg.nrrd" and exclude:
+            union = _segnrrd_union_on_ref_excluding(path, ref_nii_path, exclude)
+        else:
+            union = _resample_image_to_nifti_ref(path, ref_nii_path)
+        if union.any():
+            dilated.append(dilate_mask(union, ref_aff, float(dilate_mm)))
+    return dilated
+
+
+def _resample_mask_zyx_to_nifti_ref(
+    arr_zyx: np.ndarray,
+    template_nii_path: str | Path,
+    ref_nii_path: str | Path,
+) -> np.ndarray:
+    """Resample an in-memory ZYX mask (geometry = template NIfTI) onto ref NIfTI grid."""
+    import SimpleITK as sitk
+
+    tmpl = sitk.ReadImage(str(template_nii_path))
+    ref = sitk.ReadImage(str(ref_nii_path))
+    img = sitk.GetImageFromArray(np.asarray(arr_zyx).astype(np.uint8))
+    img.CopyInformation(tmpl)
+    out = sitk.Resample(
+        img,
+        ref,
+        sitk.Transform(),
+        sitk.sitkNearestNeighbor,
+        0,
+        sitk.sitkUInt8,
+    )
+    return (sitk.GetArrayFromImage(out) > 0).astype(np.uint8)
+
+
+def load_segnrrd_union_zyx(path: str | Path):
+    """
+    Load a multilabel ``.seg.nrrd`` as a binary union (ZYX) + affine.
+
+    Returns ``(union_zyx, affine)`` or ``(None, None)`` if missing/empty.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None, None
+    try:
+        import SimpleITK as sitk
+    except ImportError:
+        return None, None
+
+    img = sitk.ReadImage(str(path))
+    arr_zyx = sitk.GetArrayFromImage(img)
+    union = (np.asarray(arr_zyx) > 0).astype(np.uint8)
+    if not union.any():
+        return None, None
+    return union, _sitk_affine_ras(img)
+
+
+def organ_suv_clean_threshold(organ_name: str) -> Optional[float]:
+    """Per-organ PET SUV threshold for the 13 mm exclusion clean step."""
+    nl = organ_name.lower()
+    if "visceral_fat" in nl or nl.startswith("fat"):
+        return SUV_CLEAN_FAT
+    if "iliopsoas" in nl or "psoas" in nl:
+        return SUV_CLEAN_PSOAS
+    # spleen / others: hard subtract only (no SUV clean unless set)
+    return None
+
+
+def _load_group_unions(
+    seg_dir: Path,
+    ref_nii_path: str | Path,
+    log_fn=None,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """
+    Load abdomen / vessels / spine unions resampled onto ``ref_nii_path`` grid.
+
+    SimpleITK resampling avoids nibabel vs .seg.nrrd affine mismatches and keeps
+    full CT resolution (do not resample groups onto the lower-res PET grid).
+    """
+    ref_nii_path = Path(ref_nii_path)
+    _, ref_aff, _ = _load_nii(ref_nii_path)
+    items: list[np.ndarray] = []
+    for name in GROUP_SEGNRRD_FILES:
+        path = seg_dir / name
+        if not path.is_file():
+            if log_fn:
+                log_fn(f"  [WARN] missing group {name}")
+            continue
+        try:
+            union = _resample_image_to_nifti_ref(path, ref_nii_path)
+        except Exception as e:
+            if log_fn:
+                log_fn(f"  [WARN] failed to load {name}: {e}")
+            continue
+        if not union.any():
+            if log_fn:
+                log_fn(f"  [WARN] empty group {name}")
+            continue
+        items.append(union)
+        if log_fn:
+            log_fn(f"  [group] {name} on CT ref  nz={int(union.sum()):,}")
+    return items, ref_aff
+
+
+def clean_organ_with_exclusion(
+    organ_arr: np.ndarray,
+    organ_affine,
+    excl_arr,
+    excl_affine,
+    pet_arr,
+    pet_affine,
+    suv_clean_thresh: float,
+) -> np.ndarray:
+    """Remove organ voxels overlapping exclusion where PET > threshold."""
+    organ_arr = organ_arr.copy()
+    excl_in = resample_to_target(excl_arr, excl_affine, organ_arr.shape, organ_affine)
+    pet_in = resample_to_target(pet_arr, pet_affine, organ_arr.shape, organ_affine)
+    remove = (organ_arr > 0) & (excl_in > 0) & (pet_in > float(suv_clean_thresh))
+    organ_arr[remove] = 0
+    return organ_arr
+
+
+def process_subject_ku_protocol(
+    seg_dir: str | Path,
+    pet_arr: np.ndarray,
+    pet_affine,
+    *,
+    organs: Sequence[str] = DEFAULT_ORGANS,
+    pet_path: str | Path | None = None,
+    ref_organ_path: str | Path | None = None,
+    ureter_suv_thresh: float = URETER_SUV_THRESH,
+    ureter_dilate_mm: float = URETER_DILATE_MM,
+    ureter_ext_inf_mm: float = URETER_EXT_INF_MM,
+    torso_radius_mm: float = URETER_TORSO_RADIUS_MM,
+    group_subtract_dilate_mm: float = GROUP_SUBTRACT_DILATE_MM,
+    clean_exclude_dilate_mm: float = CLEAN_EXCLUDE_DILATE_MM,
+    suv_clean_fat: float = SUV_CLEAN_FAT,
+    suv_clean_psoas: float = SUV_CLEAN_PSOAS,
+    connect_path: bool = True,
+    fill_holes: bool = True,
+    skip_done: bool = True,
+    write_ureter: bool = True,
+    log=None,
+) -> dict:
+    """
+    KU post-processing protocol:
+
+      1. Build PET ureter mask (SUV thresh / dilate / L5 extend / torso cylinder;
+         fill holes + bridge gaps on).
+      2. Dilate abdomen + vessels + spine by ``group_subtract_dilate_mm`` (5 mm)
+         and hard-subtract from each target organ.
+      3. Dilate ureter + abdomen + vessels + spine by ``clean_exclude_dilate_mm``
+         (13 mm); in overlap with fat/psoas, remove voxels with PET above
+         organ-specific SUV (fat 1.2, psoas 1.6).
+      4. Visceral fat is also clipped to L1–L5 Z.
+
+    Writes ``ureter_from_pet.nii.gz`` and ``<stem>_processed.nii.gz``.
+    """
+    seg_dir = Path(seg_dir)
+    info = {"seg_dir": str(seg_dir), "organs": [], "skipped": [], "errors": []}
+
+    def _info(msg: str):
+        print(msg)
+        if log and hasattr(log, "info"):
+            log.info(msg)
+
+    organ_list = []
+    for name in organs:
+        n = str(name)
+        if not (n.endswith(".nii.gz") or n.endswith(".nii")):
+            n = n + ".nii.gz"
+        organ_list.append(n)
+
+    ref_nii = Path(ref_organ_path) if ref_organ_path else _resolve_ref_nii(seg_dir, organ_list)
+    ref_arr, ref_aff, _ = _load_nii(ref_nii)
+    pet_nii = Path(pet_path) if pet_path else _guess_pet_nii(seg_dir)
+    _info(f"  [ref] CT grid: {ref_nii.name}  shape={ref_arr.shape}")
+
+    z_inf, z_sup = vertebrae_z_bounds(seg_dir)
+    cx, cy = torso_center_xy(seg_dir)
+    _info(f"  [Z] L1-L5 bounds: {z_inf:.1f} .. {z_sup:.1f} mm")
+
+    vox = np.abs(np.diag(np.asarray(pet_affine))[:3])
+    spacing_zyx = (float(vox[2]), float(vox[1]), float(vox[0]))
+
+    # ── 1. Ureter mask ───────────────────────────────────────────────────────
+    ureter_path = seg_dir / "ureter_from_pet.nii.gz"
+    if skip_done and ureter_path.is_file() and write_ureter:
+        ureter_arr, ureter_aff, _ = _load_nii(ureter_path)
+        _info(f"  [SKIP] ureter exists: {ureter_path.name}")
+    else:
+        _info(
+            f"  [ureter] SUV>{ureter_suv_thresh} dilate={ureter_dilate_mm}mm "
+            f"extend_below_L5={ureter_ext_inf_mm}mm "
+            f"connect={connect_path} fill_holes={fill_holes}"
+        )
+        ureter_arr = build_ureter_mask_from_pet(
+            pet_arr,
+            pet_affine,
+            spacing_zyx,
+            z_inferior=float(z_inf),
+            z_superior=float(z_sup),
+            suv_thresh=float(ureter_suv_thresh),
+            dilate_mm=float(ureter_dilate_mm),
+            torso_center_xy=(cx, cy),
+            ureter_ext_inf_mm=float(ureter_ext_inf_mm),
+            torso_radius_mm=float(torso_radius_mm),
+            connect_path=connect_path,
+            fill_holes=fill_holes,
+        )
+        ureter_aff = pet_affine
+        if write_ureter:
+            import nibabel as nib
+
+            # reuse PET affine header via a lightweight ref image
+            pet_xyz = np.transpose(ureter_arr, (2, 1, 0)).astype(np.uint8)
+            ref = nib.Nifti1Image(pet_xyz, pet_affine)
+            _save_nii(ureter_arr, ref, ureter_path)
+            _info(f"  [OK] ureter → {ureter_path.name}  nz={int(ureter_arr.sum()):,}")
+
+    # ── Group unions (abdomen / vessels / spine) on CT reference grid ─────────
+    group_masks, group_aff = _load_group_unions(seg_dir, ref_nii, log_fn=_info)
+    if not group_masks:
+        _info("  [WARN] no abdomen/vessels/spine .seg.nrrd groups found")
+
+    # Pre-dilate groups for step 2 logging / step 3 exclusion (full abdomen union)
+    group_dilated_5 = [
+        dilate_mask(g, group_aff, float(group_subtract_dilate_mm)) for g in group_masks
+    ]
+
+    # Exclusion for step 3: ureter ∪ groups on CT grid, then dilate 13 mm
+    if pet_nii and pet_nii.is_file():
+        ureter_on_ct = _resample_mask_zyx_to_nifti_ref(ureter_arr, pet_nii, ref_nii)
+    else:
+        _info("  [WARN] PET NIfTI path unknown — affine resample ureter → CT ref")
+        ureter_on_ct = resample_to_target(
+            ureter_arr, ureter_aff, ref_arr.shape, ref_aff
+        )
+        ureter_on_ct = (ureter_on_ct > 0).astype(np.uint8)
+
+    excl_base = (ureter_on_ct > 0).astype(np.uint8)
+    for g in group_masks:
+        excl_base = np.maximum(excl_base, (g > 0).astype(np.uint8))
+    excl_dilated_13 = dilate_mask(excl_base, ref_aff, float(clean_exclude_dilate_mm))
+    _info(
+        f"  [excl] CT grid 5mm subtract groups={len(group_dilated_5)}  "
+        f"13mm clean excl nz={int(excl_dilated_13.sum()):,}"
+    )
+
+    # ── Per-target organ ─────────────────────────────────────────────────────
+    for organ_name in organ_list:
+        opath = seg_dir / organ_name
+        if not opath.is_file():
+            info["skipped"].append(organ_name)
+            _info(f"  [SKIP] missing {organ_name}")
+            continue
+        stem = organ_name
+        for ext in (".nii.gz", ".nii"):
+            if stem.endswith(ext):
+                stem = stem[: -len(ext)]
+                break
+        out_path = seg_dir / f"{stem}_processed.nii.gz"
+        if skip_done and out_path.is_file():
+            info["skipped"].append(organ_name)
+            _info(f"  [SKIP] exists {out_path.name}")
+            continue
+
+        try:
+            oarr, oaff, oimg = _load_nii(opath)
+            nz0 = int((oarr > 0).sum())
+            processed = oarr.copy()
+
+            # VF: always clip to L1–L5
+            is_vf = "visceral_fat" in stem.lower()
+            if is_vf:
+                processed = clip_organ_to_z(processed, oaff, float(z_inf), float(z_sup))
+                _info(
+                    f"  [clip] {stem} → L1-L5  "
+                    f"nz {nz0:,} → {int((processed > 0).sum()):,}"
+                )
+                nz0 = int((processed > 0).sum())
+
+            # Step 2: hard-subtract 5 mm dilated abdomen/vessels/spine
+            group_sub_5 = _group_dilated_for_subtract(
+                seg_dir,
+                ref_nii,
+                ref_aff,
+                group_subtract_dilate_mm,
+                stem,
+            )
+            if group_sub_5:
+                before = int((processed > 0).sum())
+                if processed.shape == ref_arr.shape and np.allclose(oaff, ref_aff):
+                    processed = subtract_dilated_union(
+                        processed,
+                        oaff,
+                        [],
+                        same_grid_items=group_sub_5,
+                    )
+                else:
+                    processed = subtract_dilated_union(
+                        processed,
+                        oaff,
+                        [(g, ref_aff) for g in group_sub_5],
+                    )
+                _info(
+                    f"  [sub5] {stem}  "
+                    f"nz {before:,} → {int((processed > 0).sum()):,}"
+                )
+
+            # Step 3: SUV-clean in 13 mm dilated ureter∪groups (fat / psoas)
+            nl = stem.lower()
+            if "visceral_fat" in nl:
+                thresh = float(suv_clean_fat)
+            elif "iliopsoas" in nl or "psoas" in nl:
+                thresh = float(suv_clean_psoas)
+            else:
+                thresh = None
+
+            if thresh is not None:
+                before = int((processed > 0).sum())
+                if processed.shape == ref_arr.shape and np.allclose(oaff, ref_aff):
+                    excl_for_organ = excl_dilated_13
+                else:
+                    excl_for_organ = resample_to_target(
+                        excl_dilated_13, ref_aff, processed.shape, oaff
+                    )
+                    excl_for_organ = (excl_for_organ > 0).astype(np.uint8)
+                processed = clean_organ_with_exclusion(
+                    processed,
+                    oaff,
+                    excl_for_organ,
+                    oaff,
+                    pet_arr,
+                    pet_affine,
+                    float(thresh),
+                )
+                _info(
+                    f"  [clean13] {stem} SUV>{thresh}  "
+                    f"nz {before:,} → {int((processed > 0).sum()):,}"
+                )
+
+            _save_nii(processed, oimg, out_path)
+            info["organs"].append(str(out_path.name))
+            _info(
+                f"  [OK] {out_path.name}  "
+                f"nz {int((oarr > 0).sum()):,} → {int((processed > 0).sum()):,}"
+            )
+        except Exception as e:
+            info["errors"].append(f"{organ_name}: {e}")
+            _info(f"  [ERR] {organ_name}: {e}")
+
+    return info
+
+
+def _lumbar_union_from_spine_segnrrd(seg_dir: Path):
+    """
+    Load L1–L5 from ``spine.seg.nrrd`` (ZYX uint8 union + affine).
+
+    Returns (union_zyx, affine) or (None, None) if unavailable.
+    """
+    spine_path = seg_dir / "spine.seg.nrrd"
+    if not spine_path.is_file():
+        return None, None
+    try:
+        import SimpleITK as sitk
+    except ImportError:
+        return None, None
+
+    img = sitk.ReadImage(str(spine_path))
+    arr_zyx = sitk.GetArrayFromImage(img)
+    wanted = {"L1", "L2", "L3", "L4", "L5",
+              "vertebrae_L1", "vertebrae_L2", "vertebrae_L3",
+              "vertebrae_L4", "vertebrae_L5"}
+    labels = []
+    # Slicer-style metadata written by write_seg_nrrd
+    i = 0
+    while True:
+        name_key = f"Segment{i}_Name"
+        lab_key = f"Segment{i}_LabelValue"
+        if not img.HasMetaDataKey(name_key):
+            break
+        name = str(img.GetMetaData(name_key)).strip()
+        try:
+            lab = int(float(img.GetMetaData(lab_key))) if img.HasMetaDataKey(lab_key) else i + 1
+        except Exception:
+            lab = i + 1
+        if name in wanted:
+            labels.append(lab)
+        i += 1
+
+    # Fallback: if metadata missing, use all non-zero labels (still better than fail)
+    if not labels:
+        uniq = [int(v) for v in np.unique(arr_zyx) if int(v) != 0]
+        # Prefer first 5 labels if names unavailable (L1-L5 usually packed first)
+        labels = uniq[:5] if uniq else []
+
+    if not labels:
+        return None, None
+
+    union = np.zeros(arr_zyx.shape, dtype=np.uint8)
+    for lab in labels:
+        union |= (arr_zyx == lab).astype(np.uint8)
+    if not union.any():
+        return None, None
+    return union, _sitk_affine_ras(img)
+
+
 def vertebrae_z_bounds(seg_dir: Path, vertebrae_files: Sequence[str] = DEFAULT_VERTEBRAE):
     """Union L1–L5 masks and return RAS Z min/max."""
     union = None
@@ -248,9 +784,11 @@ def vertebrae_z_bounds(seg_dir: Path, vertebrae_files: Sequence[str] = DEFAULT_V
         union = arr.astype(np.uint8) if union is None else np.maximum(union, (arr > 0).astype(np.uint8))
         affine = aff
     if union is None or affine is None:
+        union, affine = _lumbar_union_from_spine_segnrrd(Path(seg_dir))
+    if union is None or affine is None:
         raise FileNotFoundError(
-            f"No vertebrae files found in {seg_dir} "
-            f"(tried {list(vertebrae_files)[:3]}…)"
+            f"No lumbar vertebrae found in {seg_dir} "
+            f"(loose L1–L5 NIfTI or spine.seg.nrrd)"
         )
     return z_bounds_from_mask(union, affine)
 
@@ -272,7 +810,15 @@ def torso_center_xy(seg_dir: Path, vertebrae_files: Sequence[str] = DEFAULT_VERT
         ras = (np.asarray(aff) @ ijk.T).T
         pts.append(ras[:, :2].mean(axis=0))
     if not pts:
-        raise FileNotFoundError(f"No vertebrae voxels for centroid in {seg_dir}")
+        union, aff = _lumbar_union_from_spine_segnrrd(Path(seg_dir))
+        if union is None or aff is None:
+            raise FileNotFoundError(f"No vertebrae voxels for centroid in {seg_dir}")
+        idx = np.argwhere(union > 0)
+        ijk = np.column_stack(
+            [idx[:, 2], idx[:, 1], idx[:, 0], np.ones(len(idx))]
+        ).astype(np.float64)
+        ras = (np.asarray(aff) @ ijk.T).T
+        pts.append(ras[:, :2].mean(axis=0))
     mean = np.mean(np.stack(pts, axis=0), axis=0)
     return float(mean[0]), float(mean[1])
 
@@ -362,7 +908,10 @@ def process_subject_seg_dir(
                 suv_thresh=suv_thresh,
                 dilate_mm=dilate_mm,
                 torso_center_xy=(cx, cy),
+                ureter_ext_inf_mm=URETER_EXT_INF_MM,
+                torso_radius_mm=URETER_TORSO_RADIUS_MM,
                 connect_path=connect_path,
+                fill_holes=True,
             )
             import nibabel as nib
 

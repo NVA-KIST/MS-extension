@@ -30,19 +30,82 @@ SPINE_STEMS = [
     "sacrum",
 ]
 
+# Display names inside spine.seg.nrrd (individual selectable segments)
+SPINE_SEGMENT_NAMES = {
+    "vertebrae_L1": "L1",
+    "vertebrae_L2": "L2",
+    "vertebrae_L3": "L3",
+    "vertebrae_L4": "L4",
+    "vertebrae_L5": "L5",
+    "vertebrae_T1": "T1",
+    "vertebrae_T2": "T2",
+    "vertebrae_T3": "T3",
+    "vertebrae_T4": "T4",
+    "vertebrae_T5": "T5",
+    "vertebrae_T6": "T6",
+    "vertebrae_T7": "T7",
+    "vertebrae_T8": "T8",
+    "vertebrae_T9": "T9",
+    "vertebrae_T10": "T10",
+    "vertebrae_T11": "T11",
+    "vertebrae_T12": "T12",
+    "sacrum": "sacrum",
+}
+
 ABDOMEN_STEMS = [
-    "liver", "spleen", "kidney_left", "kidney_right",
-    "gallbladder", "stomach", "pancreas",
-    "adrenal_gland_left", "adrenal_gland_right",
-    "small_bowel", "duodenum", "colon", "urinary_bladder",
+    "liver",
+    "spleen",
+    "pancreas",
+    "kidney_right",
+    "kidney_left",
+    "gallbladder",
+    "adrenal_gland_right",
+    "adrenal_gland_left",
+    # Hollow / GI
+    "urinary_bladder",
+    "small_bowel",
+    "colon",
+    "duodenum",
+    "stomach",
 ]
 
+# Kept as individual .nii.gz only (NOT packaged into a .seg.nrrd group)
 TARGET_ORGANS = [
     ("iliopsoas_left", "psoas_left"),
     ("iliopsoas_right", "psoas_right"),
     ("spleen", "spleen"),
     ("visceral_fat", "visceral_fat"),
 ]
+
+# Loose NIfTIs that are only intermediates for groups / combined_mask.
+# After packaging they are deleted (targets + combined_mask.nii.gz are kept).
+LOOSE_ANATOMY_STEMS = list(dict.fromkeys(
+    [
+        *VESSEL_STEMS,
+        *SPINE_STEMS,
+        *ABDOMEN_STEMS,
+        "liver",
+        "heart",
+        "body_trunc",
+        "body",
+        "body_extremities",
+        "skin",
+        "torso_fat",
+        "subcutaneous_fat",
+        "skeletal_muscle",
+        *[f"rib_left_{i}" for i in range(1, 13)],
+        *[f"rib_right_{i}" for i in range(1, 13)],
+    ]
+))
+
+KEEP_AFTER_CLEANUP_STEMS = {
+    "visceral_fat",
+    "spleen",
+    "iliopsoas_left",
+    "iliopsoas_right",
+    "combined_mask",
+    "ureter_from_pet",
+}
 
 # combined_mask flat labels → segment names
 COMBINED_LABEL_NAMES = {
@@ -184,20 +247,27 @@ def package_patient_segmentations(
     out_dir: Optional[str] = None,
     *,
     include_combined: bool = True,
-    include_targets: bool = True,
+    include_targets: bool = False,
     include_vessels: bool = True,
     include_spine: bool = True,
     include_abdomen: bool = True,
+    cleanup_loose: bool = True,
 ) -> Dict[str, str]:
     """
     Build the .seg.nrrd set for one patient Segments folder.
 
     Outputs (by default into ``seg_dir``):
-      - target_organs.seg.nrrd   (psoas_left/right, spleen, visceral_fat)
       - combined_mask.seg.nrrd   (subsegments from combined label map)
       - vessels.seg.nrrd
-      - spine.seg.nrrd
+      - spine.seg.nrrd           (individual L1..L5, T1..T12, sacrum)
       - abdomen.seg.nrrd
+
+    Target organs (visceral_fat, spleen, iliopsoas L/R) stay as individual
+    ``.nii.gz`` files and are NOT bundled into a group (``include_targets``
+    defaults to False).
+
+    When ``cleanup_loose`` is True (default), intermediate anatomy / body /
+    tissue NIfTIs that were packed into groups are deleted afterward.
     """
     import SimpleITK as sitk
 
@@ -224,14 +294,11 @@ def package_patient_segmentations(
         write_seg_nrrd(out_path, segs, ref)
         return out_path
 
-    # ── Target organs ────────────────────────────────────────────────────────
+    # ── Target organs: optional only (default off — keep as flat NIfTI) ──────
     if include_targets:
         items = []
         for file_stem, seg_name in TARGET_ORGANS:
             hits = _pick_existing(seg_dir, [file_stem])
-            if not hits and file_stem.startswith("iliopsoas"):
-                # already covered
-                pass
             if hits:
                 items.append((seg_name, load_mask_xyz(hits[0][1], ref)))
         path = _pack("target_organs", items)
@@ -267,10 +334,11 @@ def package_patient_segmentations(
             written["vessels"] = path
 
     if include_spine:
-        items = [
-            (stem, load_mask_xyz(fp, ref))
-            for stem, fp in _pick_existing(seg_dir, SPINE_STEMS)
-        ]
+        # One selectable segment per vertebra (L1, L2, …) — never merged.
+        items = []
+        for stem, fp in _pick_existing(seg_dir, SPINE_STEMS):
+            seg_name = SPINE_SEGMENT_NAMES.get(stem, stem)
+            items.append((seg_name, load_mask_xyz(fp, ref)))
         path = _pack("spine", items)
         if path:
             written["spine"] = path
@@ -284,4 +352,46 @@ def package_patient_segmentations(
         if path:
             written["abdomen"] = path
 
+    if cleanup_loose:
+        removed = cleanup_loose_anatomy_files(seg_dir)
+        if removed:
+            written["cleaned_loose_files"] = str(len(removed))
+
     return written
+
+
+def cleanup_loose_anatomy_files(seg_dir: str) -> List[str]:
+    """
+    Delete intermediate single-organ NIfTIs after .seg.nrrd packaging.
+
+    Keeps target organs, combined_mask, ureter, any ``*_processed``, and all
+    ``.seg.nrrd`` group files.
+    """
+    removed: List[str] = []
+    for stem in LOOSE_ANATOMY_STEMS:
+        if stem in KEEP_AFTER_CLEANUP_STEMS:
+            continue
+        for ext in (".nii.gz", ".nii"):
+            fp = os.path.join(seg_dir, stem + ext)
+            if os.path.isfile(fp):
+                try:
+                    os.remove(fp)
+                    removed.append(os.path.basename(fp))
+                except OSError:
+                    pass
+                break
+
+    if removed:
+        print(f"[seg.nrrd] cleaned {len(removed)} loose intermediate NIfTI(s)")
+
+    # Stale group from older runs (targets stay as individual NIfTIs)
+    stale_group = os.path.join(seg_dir, "target_organs.seg.nrrd")
+    if os.path.isfile(stale_group):
+        try:
+            os.remove(stale_group)
+            removed.append("target_organs.seg.nrrd")
+            print("[seg.nrrd] removed stale target_organs.seg.nrrd")
+        except OSError:
+            pass
+
+    return removed

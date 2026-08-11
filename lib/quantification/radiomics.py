@@ -216,11 +216,112 @@ def extract_radiomics_from_paths(
     Run PyRadiomics on on-disk image + label mask.
 
     Returns feature dict with rad_* keys, optional derived_*, and metadata fields.
+
+    Large masks (e.g. visceral fat) auto-enable isotropic resampling unless
+    disabled via ``auto_resample_large=False``. On ``MemoryError``, retries with
+    coarser spacing (and larger bin width as a last resort).
     """
-    opts = radiomics_options or {}
+    opts = dict(radiomics_options or {})
     if not is_radiomics_enabled(opts):
         return {}
 
+    opts = _maybe_auto_resample_large_mask(mask_path, opts, label=label)
+
+    attempts = 0
+    last_err: Optional[BaseException] = None
+    while attempts < 4:
+        attempts += 1
+        try:
+            return _run_radiomics_extract(image_path, mask_path, opts, label=label)
+        except MemoryError as e:
+            last_err = e
+            spacing = float(opts.get("resampled_spacing_mm", 4.0))
+            bin_width = float(opts.get("bin_width", 0.25))
+            if not opts.get("resample_isotropic", False):
+                opts = dict(opts)
+                opts["resample_isotropic"] = True
+                opts["resampled_spacing_mm"] = max(spacing, 4.0)
+                print(
+                    f"[radiomics] MemoryError - enabling isotropic "
+                    f"{opts['resampled_spacing_mm']:.3g} mm resample"
+                )
+                continue
+            if spacing < 10.0:
+                opts = dict(opts)
+                opts["resampled_spacing_mm"] = min(10.0, max(spacing * 1.5, spacing + 2.0))
+                print(
+                    f"[radiomics] MemoryError - retry isotropic "
+                    f"{opts['resampled_spacing_mm']:.3g} mm"
+                )
+                continue
+            if bin_width < 1.0:
+                opts = dict(opts)
+                opts["bin_width"] = min(1.0, max(bin_width * 2.0, 0.5))
+                print(
+                    f"[radiomics] MemoryError - retry bin_width={opts['bin_width']:.3g}"
+                )
+                continue
+            raise
+    raise last_err or MemoryError("radiomics failed after retries")
+
+
+def _mask_foreground_voxels(mask_path: str, label: int = 1) -> int:
+    """Count foreground voxels; treat any positive label as ROI if label match is empty."""
+    arr = None
+    try:
+        import SimpleITK as sitk
+
+        arr = sitk.GetArrayFromImage(sitk.ReadImage(mask_path))
+    except Exception:
+        try:
+            import nibabel as nib
+            import numpy as np
+
+            arr = np.asarray(nib.load(mask_path).dataobj)
+        except Exception:
+            return 0
+
+    import numpy as np
+
+    arr = np.asarray(arr)
+    if label is not None:
+        n = int((arr == label).sum())
+        if n > 0:
+            return n
+    return int((arr > 0).sum())
+
+
+def _maybe_auto_resample_large_mask(
+    mask_path: str,
+    opts: dict,
+    *,
+    label: int = 1,
+) -> dict:
+    if opts.get("resample_isotropic", False):
+        return opts
+    if opts.get("auto_resample_large", True) is False:
+        return opts
+    threshold = int(opts.get("large_mask_voxels", 200_000))
+    n = _mask_foreground_voxels(mask_path, label=label)
+    if n < threshold:
+        return opts
+    out = dict(opts)
+    out["resample_isotropic"] = True
+    out.setdefault("resampled_spacing_mm", 4.0)
+    print(
+        f"[radiomics] large mask ({n:,} voxels) - "
+        f"auto isotropic resample {out['resampled_spacing_mm']} mm"
+    )
+    return out
+
+
+def _run_radiomics_extract(
+    image_path: str,
+    mask_path: str,
+    opts: dict,
+    *,
+    label: int = 1,
+) -> dict[str, Any]:
     extractor = make_radiomics_extractor(opts)
     raw = extractor.execute(image_path, mask_path, label=label)
     features = normalize_raw_radiomics(raw)

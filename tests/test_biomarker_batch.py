@@ -50,6 +50,7 @@ def test_auxiliary_and_label():
     assert is_auxiliary_segment_stem("kidney_left")
     assert not is_auxiliary_segment_stem("psoas_major")
     assert default_excel_label("liver.seg") == "liver"
+    assert default_excel_label("visceral_fat_processed") == "visceral_fat"
     print("  PASS  auxiliary / default_excel_label")
 
 
@@ -75,6 +76,50 @@ def test_parse_qi_and_signature():
     print("  PASS  parse_quantitative_indices_results / computation_signature")
 
 
+def test_excel_quant_radiomics_sheets():
+    import tempfile
+    from openpyxl import load_workbook
+    from lib.quantification.biomarker_batch import (
+        QUANTIFICATION_SHEET,
+        RADIOMICS_SHEET,
+        save_batch_rows_to_excel,
+    )
+
+    rows = [
+        {
+            "subject_id": "MSP0001",
+            "patient_id": "",
+            "scan_date": "2025-01-01",
+            "segment": "spleen",
+            "source_file": "spleen.nii.gz",
+            "volume_mL": 100.0,
+            "suv_mean": 1.2,
+            "suv_max": 3.4,
+            "suv_peak": 2.1,
+            "tlg": 120.0,
+            "rad_firstorder_Entropy": 0.5,
+            "rad_glcm_Contrast": 0.1,
+            "radiomics_status": "done",
+            "computation_signature": "test",
+            "status": "done",
+        }
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        out = str(Path(td) / "metrics.xlsx")
+        save_batch_rows_to_excel(rows, out, append=False)
+        wb = load_workbook(out)
+        assert QUANTIFICATION_SHEET in wb.sheetnames
+        assert RADIOMICS_SHEET in wb.sheetnames
+        assert "Summary" in wb.sheetnames
+        q_header = [c.value for c in wb[QUANTIFICATION_SHEET][1]]
+        assert "suv_max" in q_header
+        assert "rad_firstorder_Entropy" not in q_header
+        r_header = [c.value for c in wb[RADIOMICS_SHEET][1]]
+        assert "rad_firstorder_Entropy" in r_header
+        assert "suv_max" not in r_header
+    print("  PASS  excel Quantification + Radiomics sheets")
+
+
 def main():
     print("test_biomarker_batch")
     test_parse_batch_base_name()
@@ -82,6 +127,7 @@ def main():
     test_safe_asymmetry()
     test_auxiliary_and_label()
     test_parse_qi_and_signature()
+    test_excel_quant_radiomics_sheets()
     print("ALL PASSED")
 
 

@@ -64,12 +64,135 @@ def compute_suvbw_factor(
     return weight_g / decay_corrected_dose_bq
 
 
+def suvbw_factor_from_dicom_folder(dicom_folder: str) -> tuple[float, dict[str, Any]]:
+    """
+    Read PET DICOM headers and return (SUVbw factor, meta).
+
+    If Units is already ``SUV``, factor is ``1.0``.
+    Prefers files that contain RadiopharmaceuticalInformationSequence.
+    """
+    import pydicom
+
+    candidates: list[str] = []
+    for root, _, files in os.walk(dicom_folder):
+        for f in sorted(files):
+            fp = os.path.join(root, f)
+            try:
+                ds = pydicom.dcmread(fp, stop_before_pixels=True)
+            except Exception:
+                continue
+            candidates.append(fp)
+            # Prefer a true PET image slice with radio / dose metadata
+            if (0x0054, 0x0016) in ds and getattr(ds, "PatientWeight", None) is not None:
+                candidates.insert(0, fp)
+                break
+
+    if not candidates:
+        raise ValueError(f"No readable DICOM file found in {dicom_folder}")
+
+    ds = None
+    first_dcm = None
+    for fp in candidates:
+        try:
+            cand = pydicom.dcmread(fp, stop_before_pixels=True)
+        except Exception:
+            continue
+        if (0x0054, 0x0016) in cand:
+            ds = cand
+            first_dcm = fp
+            break
+        if ds is None:
+            ds = cand
+            first_dcm = fp
+
+    if ds is None or first_dcm is None:
+        raise ValueError(f"No readable DICOM file found in {dicom_folder}")
+
+    units = str(getattr(ds, "Units", "BQML")).strip().upper()
+    meta: dict[str, Any] = {"units": units, "dicom_file": first_dcm}
+    if units == "SUV":
+        meta["skipped"] = True
+        return 1.0, meta
+
+    try:
+        weight_kg = float(str(getattr(ds, "PatientWeight", None)))
+        if math.isnan(weight_kg):
+            raise ValueError("PatientWeight is NaN")
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"PatientWeight missing or unreadable in DICOM header: {e}") from e
+
+    try:
+        radio_seq = ds[0x0054, 0x0016][0]
+    except (KeyError, IndexError) as e:
+        raise ValueError(
+            "RadiopharmaceuticalInformationSequence (0054,0016) missing - cannot compute SUV"
+        ) from e
+
+    try:
+        dose_bq = float(str(radio_seq[0x0018, 0x1074].value))
+    except (KeyError, ValueError) as e:
+        raise ValueError(
+            "RadionuclideTotalDose (0018,1074) missing from RadiopharmaceuticalInformationSequence"
+        ) from e
+
+    inj_dt = getattr(radio_seq, "RadiopharmaceuticalStartDateTime", None)
+    inj_t = getattr(radio_seq, "RadiopharmaceuticalStartTime", None)
+    if inj_dt:
+        inj_str = str(inj_dt).split(".")[0]
+    elif inj_t:
+        inj_str = str(inj_t).split(".")[0]
+    else:
+        raise ValueError(
+            "No injection time found in RadiopharmaceuticalInformationSequence"
+        )
+
+    try:
+        half_life_s = float(str(radio_seq[0x0018, 0x1075].value))
+    except (KeyError, ValueError):
+        try:
+            half_life_s = float(str(ds[0x0009, 0x103F].value))
+        except (KeyError, ValueError):
+            half_life_s = 6586.2  # F-18 default
+
+    acq_t_raw = str(
+        getattr(ds, "AcquisitionTime", "") or getattr(ds, "SeriesTime", "")
+    ).split(".")[0].strip()
+    decay_corr = str(getattr(ds, "DecayCorrection", "START")).strip().upper()
+
+    factor = compute_suvbw_factor(
+        weight_kg=weight_kg,
+        dose_bq=dose_bq,
+        injection_time=inj_str,
+        acquisition_time=acq_t_raw,
+        half_life_s=half_life_s,
+        decay_correction=decay_corr,
+    )
+    meta.update(
+        {
+            "weight_kg": weight_kg,
+            "dose_bq": dose_bq,
+            "injection_time": inj_str,
+            "acquisition_time": acq_t_raw,
+            "half_life_s": half_life_s,
+            "decay_correction": decay_corr,
+            "suv_factor": factor,
+        }
+    )
+    return factor, meta
+
+
 def save_excel(rows: list[dict], output_file: str, append: bool = True, log=None) -> None:
     """
-    Write Data + Summary sheets via openpyxl.
+    Write Quantification + Summary sheets via openpyxl.
     Port of PETCTQuantAnalysis_v2Logic._saveExcel.
     """
     import openpyxl
+
+    from lib.quantification.biomarker_batch import (
+        LEGACY_DATA_SHEET,
+        QUANTIFICATION_SHEET,
+        quantification_sheet_name,
+    )
 
     def _log(msg: str):
         if log:
@@ -92,17 +215,25 @@ def save_excel(rows: list[dict], output_file: str, append: bool = True, log=None
         for stale in ("Sheet", "Sheet1", "Results"):
             if stale in wb.sheetnames:
                 del wb[stale]
+        if (
+            LEGACY_DATA_SHEET in wb.sheetnames
+            and QUANTIFICATION_SHEET not in wb.sheetnames
+        ):
+            wb[LEGACY_DATA_SHEET].title = QUANTIFICATION_SHEET
     else:
         wb = openpyxl.Workbook()
 
-    if "Data" in wb.sheetnames:
-        ws = wb["Data"]
+    sheet = quantification_sheet_name(wb.sheetnames)
+    if sheet is not None:
+        ws = wb[sheet]
+        if sheet != QUANTIFICATION_SHEET:
+            ws.title = QUANTIFICATION_SHEET
     else:
         if wb.active and wb.active.title in ("Sheet", "Results"):
             ws = wb.active
-            ws.title = "Data"
+            ws.title = QUANTIFICATION_SHEET
         else:
-            ws = wb.create_sheet("Data", 0)
+            ws = wb.create_sheet(QUANTIFICATION_SHEET, 0)
         for ci, col in enumerate(DATA_COLS, 1):
             ws.cell(row=1, column=ci, value=col)
 
@@ -234,6 +365,7 @@ def run_batch_quantification(
       - for each stem, load mask NIfTI (prefer ``*_processed.nii.gz``)
       - compute numpy SUV metrics (+ optional PyRadiomics)
       - write Excel via ``save_batch_rows_to_excel``
+      (Quantification sheet + Radiomics sheet when enabled)
     """
     from datetime import datetime as _dt
     from pathlib import Path
@@ -246,8 +378,8 @@ def run_batch_quantification(
         computation_signature,
         default_excel_label,
         existing_batch_keys,
-        find_batch_segment_file,
         parse_batch_base_name,
+        resolve_batch_segment_file,
         save_batch_rows_to_excel,
         scan_batch_dataset,
     )
@@ -303,6 +435,28 @@ def run_batch_quantification(
                 pet_dicom_dir=dcm if dcm.is_dir() else None,
                 pet_nii_out=nii,
             )
+            # Convert Bq/mL -> SUVbw using PET DICOM headers (required for
+            # meaningful metrics and for PyRadiomics binWidth).
+            if dcm.is_dir():
+                try:
+                    suv_factor, suv_meta = suvbw_factor_from_dicom_folder(str(dcm))
+                    if suv_meta.get("skipped"):
+                        _log("  [SUV] DICOM already in SUV units")
+                    else:
+                        import numpy as np
+
+                        pet_arr = (
+                            np.asarray(pet_arr, dtype=np.float32) * float(suv_factor)
+                        ).astype(np.float32)
+                        _log(
+                            f"  [SUV] factor={suv_factor:.6g}  "
+                            f"weight={suv_meta.get('weight_kg')} kg  "
+                            f"PET max after={float(np.max(pet_arr)):.4g}"
+                        )
+                except Exception as e:
+                    _log(f"  [SUV] WARN conversion failed ({e}); metrics may be Bq/mL")
+            else:
+                _log("  [SUV] WARN no PET DICOM folder - assuming NIfTI is already SUV")
             # spacing from affine diagonal (approx mm)
             sp = tuple(float(abs(pet_aff[i, i])) for i in range(3))
             # pet_arr is ZYX; affine diag is often XYZ → reorder
@@ -310,24 +464,17 @@ def run_batch_quantification(
 
             for stem in segment_stems:
                 label = default_excel_label(stem)
-                # Prefer processed masks when present
-                candidates = []
-                if prefer_processed:
-                    candidates.append(f"{stem}_processed")
-                    if stem.endswith(".nii.gz"):
-                        candidates.append(stem[: -len(".nii.gz")] + "_processed")
-                candidates.append(stem)
-                seg_path = None
-                for c in candidates:
-                    hit = find_batch_segment_file(str(seg_dir), c.replace(".nii.gz", ""))
-                    if hit:
-                        seg_path = hit
-                        break
+                seg_path = resolve_batch_segment_file(
+                    str(seg_dir),
+                    stem,
+                    prefer_processed=prefer_processed,
+                )
                 if seg_path is None:
                     rows.append(
                         batch_error_row(subject_id, scan_date, label, "missing_file", stem)
                     )
                     continue
+                _log(f"  [mask] {label} ← {os.path.basename(seg_path)}")
 
                 try:
                     import nibabel as nib
@@ -343,9 +490,23 @@ def run_batch_quantification(
                     results = compute_segment_metrics(
                         pet_arr, m_zyx, spacing_zyx, metrics=metrics
                     )
-                    rad_status = "not_run"
-                    if do_rad:
-                        # Write temp matching grids for pyradiomics
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                    rows.append(
+                        batch_error_row(
+                            subject_id,
+                            scan_date,
+                            label,
+                            f"metric_error:{err[:80]}",
+                            stem,
+                        )
+                    )
+                    _log(f"  [ERR] {stem}: {err}")
+                    continue
+
+                rad_status = "not_run"
+                if do_rad:
+                    try:
                         import tempfile
 
                         with tempfile.TemporaryDirectory() as td:
@@ -362,32 +523,25 @@ def run_batch_quantification(
                             )
                             results.update(rad)
                             rad_status = "done"
+                    except Exception as e:
+                        err = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                        rad_status = f"radiomics_error:{err[:80]}"
+                        _log(f"  [RAD] {label}: {err}")
 
-                    row = {
-                        "subject_id": subject_id,
-                        "patient_id": "",
-                        "scan_date": scan_date,
-                        "segment": label,
-                        "source_file": os.path.basename(seg_path),
-                        "radiomics_status": rad_status,
-                        "computation_signature": sig,
-                        "status": "done",
-                        "computed_at": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    }
-                    row.update(results)
-                    rows.append(row)
-                    _log(f"  [OK] {label} SUVmax={results.get('suv_max', 'NA')}")
-                except Exception as e:
-                    rows.append(
-                        batch_error_row(
-                            subject_id,
-                            scan_date,
-                            label,
-                            f"metric_error:{str(e)[:80]}",
-                            stem,
-                        )
-                    )
-                    _log(f"  [ERR] {stem}: {e}")
+                row = {
+                    "subject_id": subject_id,
+                    "patient_id": "",
+                    "scan_date": scan_date,
+                    "segment": label,
+                    "source_file": os.path.basename(seg_path),
+                    "radiomics_status": rad_status,
+                    "computation_signature": sig,
+                    "status": "done",
+                    "computed_at": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                row.update(results)
+                rows.append(row)
+                _log(f"  [OK] {label} SUVmax={results.get('suv_max', 'NA')}")
 
             processed += 1
         except Exception as e:

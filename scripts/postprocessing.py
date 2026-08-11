@@ -1,21 +1,21 @@
 """
 postprocessing.py
 =================
-Python-IDE / CLI entry for organ post-processing (same lib as Slicer
-UreterPostProcess array cores).
-
-Inject a dataset root::
+Python-IDE / CLI entry for KU organ post-processing.
 
     cd extension_new
-    python scripts/postprocessing.py --root E:\\KUPETCTMS\\new_data_clean --list-organs
-    python scripts/postprocessing.py --root E:\\KUPETCTMS\\new_data_clean --interactive
+    python scripts/postprocessing.py --root "E:\\KUPETCTMS\\temp sample" --limit 1
+    python scripts/postprocessing.py --root "E:\\KUPETCTMS\\temp sample" --no-skip-done
 
-    python scripts/postprocessing.py --root E:\\KUPETCTMS\\new_data_clean ^
-        --organ-mode "visceral_fat.nii.gz:Clip + Clean,spleen.nii.gz:Clip only"
+Default KU protocol:
+  1. PET ureter mask (SUV 2.5, dilate 18 mm, extend 50 mm below L5,
+     fill holes + bridge gaps)
+  2. Dilate abdomen/vessels/spine 5 mm → hard-subtract from targets
+  3. Dilate ureter∪groups 13 mm → remove overlap voxels with PET >
+     1.2 (visceral fat) or 1.6 (psoas)
+  4. Visceral fat also clipped to L1–L5
 
-Writes per Segments/<ID>_Seg/:
-  ureter_from_pet.nii.gz
-  <stem>_processed.nii.gz
+Writes ``ureter_from_pet.nii.gz`` and ``*_processed.nii.gz``.
 """
 from __future__ import annotations
 
