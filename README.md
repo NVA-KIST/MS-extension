@@ -85,8 +85,8 @@ Folder names must match `{SubjectID}_{YYYY-MM-DD}_{CT|PET|Seg}`.
 
 ```bash
 python scripts/organize.py \
-  --src  "C:\Users\ishit\Downloads\2026-03__Studies" \
-  --dest "E:\KUPETCTMS\new_data_clean"
+  --src  /path/to/inbound \
+  --dest /path/to/DATASET_ROOT
 ```
 
 Also accepts: a parent of several `*__Studies` months, an already-organized `CT/`+`PET/` tree, or any nested DICOM folders (grouped by Study UID). Same hospital `PatientID` reuses the same `MSPxxxx`.
@@ -95,34 +95,91 @@ Also accepts: a parent of several `*__Studies` months, an already-organized `CT/
 
 ## CLI (batch)
 
+Full flag-by-flag reference: **[docs/SCRIPTS.md](docs/SCRIPTS.md)**.
+
+Run from the project root:
+
 ```bash
-# inbound dump -> organize + full pipeline (uses default checkpoint)
-python scripts/run_pipeline.py \
-  --src   "C:/Users/ishit/Downloads/2026-03__Studies" \
-  --root  "E:/data/new_data_clean" \
-  --out   "E:/data/new_data_clean/metrics.xlsx" \
-  --radiomics
-
-# already organized CT/ PET/ (uses default checkpoint from lib/models/)
-python scripts/run_pipeline.py \
-  --root  "E:/data/new_data_clean" \
-  --out   "E:/data/new_data_clean/metrics.xlsx" \
-  --radiomics
-
-# or specify custom checkpoint
-python scripts/run_pipeline.py \
-  --root  "E:/data/new_data_clean" \
-  --ckpt  "path/to/custom/checkpoint.ckpt" \
-  --out   "E:/data/new_data_clean/metrics.xlsx"
+cd /path/to/extension_new
 ```
+
+### Master pipeline (recommended)
+
+**Already organized `CT/` + `PET/`:**
+
+```bash
+python scripts/run_pipeline.py \
+  --root  /path/to/DATASET_ROOT \
+  --ckpt  /path/to/epoch=399-step=8800.ckpt \
+  --out   /path/to/DATASET_ROOT/metrics.xlsx \
+  --device gpu \
+  --radiomics
+```
+
+**Raw inbound dump → organize + full pipeline:**
+
+```bash
+python scripts/run_pipeline.py \
+  --src   /path/to/inbound \
+  --root  /path/to/DATASET_ROOT \
+  --ckpt  /path/to/epoch=399-step=8800.ckpt \
+  --out   /path/to/DATASET_ROOT/metrics.xlsx \
+  --radiomics
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--root` | Dataset folder with `CT/` and `PET/` |
+| `--ckpt` | Visceral-fat SegResNet checkpoint |
+| `--out` | Excel output path |
+| `--src` | Optional inbound dump to organize into `--root` first |
+| `--device` | `gpu`, `cpu`, or device index like `0` |
+| `--radiomics` | Also extract PyRadiomics features |
+| `--limit 1` | Process only the first subject (smoke test) |
+| `--no-skip-done` | Force re-run even if outputs exist |
+| `--no-append` | Overwrite Excel instead of appending |
+| `--skip-seg` / `--skip-post` / `--skip-quant` | Skip a stage |
 
 Equivalent to `organize.py` (if `--src`) → `generate_segments.py` → `postprocessing.py` → `quantification.py`.
 
-Skip stages with `--skip-seg` / `--skip-post` / `--skip-quant`.  
-Force re-run with `--no-skip-done`.  
-One subject: `--limit 1`.
+Default checkpoint in this repo:
 
-See `python scripts/run_pipeline.py --help` for all flags (same names as the three individual scripts).
+```text
+/path/to/extension_new/lib/models/epoch=399-step=8800.ckpt
+```
+
+**Note:** TotalSegmentator can take a long time and may print little until it finishes. That is expected.
+
+### Individual stages
+
+```bash
+# 0. Organize
+python scripts/organize.py \
+  --src  /path/to/inbound \
+  --dest /path/to/DATASET_ROOT
+
+# 1. Segmentation (TS + VF + nrrd)
+python scripts/generate_segments.py \
+  --root   /path/to/DATASET_ROOT \
+  --ckpt   /path/to/epoch=399-step=8800.ckpt \
+  --device gpu
+
+# 2. Post-processing
+python scripts/postprocessing.py \
+  --root /path/to/DATASET_ROOT \
+  --organs "visceral_fat.nii.gz,iliopsoas_left.nii.gz,iliopsoas_right.nii.gz,spleen.nii.gz"
+
+# 3. Quantification
+python scripts/quantification.py \
+  --root     /path/to/DATASET_ROOT \
+  --out      /path/to/DATASET_ROOT/metrics.xlsx \
+  --segments visceral_fat,spleen,iliopsoas_left,iliopsoas_right \
+  --radiomics
+```
+
+```bash
+python scripts/run_pipeline.py --help
+```
 
 ---
 
@@ -143,20 +200,20 @@ from lib.quantification.pet_metrics import (
     run_batch_quantification,
 )
 
-raw  = Path(r"C:/Users/ishit/Downloads/2026-03__Studies")
-root = Path(r"E:/data/new_data_clean")
+raw  = Path("/path/to/inbound")
+root = Path("/path/to/DATASET_ROOT")
 # Checkpoint path (from lib.models.segresnet.default_vf_checkpoint())
-ckpt = Path(r"lib/models/epoch=399-step=8800.ckpt").resolve()
+ckpt = Path("lib/models/epoch=399-step=8800.ckpt").resolve()
 
 # 0. Organize inbound dump + extract demographics
 organize_dataset(raw, root)
 rows = extract_dataset_metadata(root)          # age, sex, weight, height, BMI, dose, …
 save_metadata(rows, csv_path=root / "scan_metadata.csv")
 # one series folder:
-extract_dicom_metadata(root / "PET" / "MSP0002_2026-05-20_PET")
+extract_dicom_metadata(root / "PET" / "SUBJECT_YYYY-MM-DD_PET")
 
-seg  = root / "Segments" / "MSP0002_2026-05-20_Seg"
-ct   = root / "CT_NIfTI" / "MSP0002_2026-05-20_CT.nii.gz"
+seg  = root / "Segments" / "SUBJECT_YYYY-MM-DD_Seg"
+ct   = root / "CT_NIfTI" / "SUBJECT_YYYY-MM-DD_CT.nii.gz"
 
 # 1. Segmentation
 run_totalseg_for_visceral_fat(ct, seg, device="gpu")
@@ -166,8 +223,8 @@ predict_visceral_fat(str(ct), str(seg / "combined_mask.nii.gz"), str(ckpt),
 package_patient_segmentations(str(seg), str(ct))
 
 # 2. Post-processing (PET as SUVbw)
-pet_arr, pet_aff, _ = load_pet_array(pet_path=root / "PET_NIfTI" / "MSP0002_2026-05-20_PET.nii.gz")
-dcm = root / "PET" / "MSP0002_2026-05-20_PET"
+pet_arr, pet_aff, _ = load_pet_array(pet_path=root / "PET_NIfTI" / "SUBJECT_YYYY-MM-DD_PET.nii.gz")
+dcm = root / "PET" / "SUBJECT_YYYY-MM-DD_PET"
 factor, meta = suvbw_factor_from_dicom_folder(str(dcm))
 if not meta.get("skipped"):
     pet_arr = pet_arr.astype("float32") * factor
@@ -185,7 +242,8 @@ run_batch_quantification(
 )
 ```
 
-Full function reference: **[docs/API.md](docs/API.md)**.
+Full function reference: **[docs/API.md](docs/API.md)**.  
+Full CLI / scripts reference: **[docs/SCRIPTS.md](docs/SCRIPTS.md)**.
 
 ---
 
@@ -207,29 +265,8 @@ Affines are 4×4 matrices mapping index `(i, j, k) = (X, Y, Z)` → RAS mm.
 | `lib.quantification` | SUV metrics, radiomics, Excel batch export |
 | `lib.io` | Organize inbound dumps, patient metadata, DICOM→NIfTI, `.seg.nrrd` |
 | `lib.models` | SegResNet + default checkpoint path |
-| `scripts/` | CLI entry points (not imported as a library) |
+| `scripts/` | CLI entry points (not imported as a library) — see [docs/SCRIPTS.md](docs/SCRIPTS.md) |
 | `slicer_modules/` | 3D Slicer GUI (optional) |
-
----
-
-## 3D Slicer setup (important)
-
-Slicer only auto-loads **top-level `*.py` module files** in an Additional Module Path.
-Use this exact folder (not `extension_new`, not the old flat `extension/` tree):
-
-```
-E:\KUPETCTMS\extension\extension_new\slicer_modules
-```
-
-Steps:
-1. **Edit → Application Settings → Modules → Additional module paths → Add**
-2. Select `...\extension_new\slicer_modules`
-3. **Restart Slicer** (required after adding/changing paths)
-4. Open **Modules → Metabolic Syndrome Toolkit**
-
-You should see Module Launcher, numbered clinical modules, Scribble Tool, PET Biomarker Studio.
-
-If a module is missing, check **Application Settings → Modules** for a “Failed to load” / ignored list and clear it, then restart.
 
 ---
 
