@@ -79,20 +79,124 @@ def _python_can_import_ts(python_exe: Path) -> bool:
             [str(python_exe), "-c", "import totalsegmentator"],
             capture_output=True,
             timeout=20,
-            env=_clean_env_for_probe(python_exe),
+            env=_env_for_external_python(python_exe),
         )
         return r.returncode == 0
     except Exception:
         return False
 
 
-def _clean_env_for_probe(python_exe: Path) -> dict:
-    env = os.environ.copy()
-    for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONNOUSERSITE"):
-        env.pop(key, None)
+_SLICER_ENV_KEYS = (
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "PYTHONNOUSERSITE",
+    "PYTHONUSERBASE",
+    "PYTHONSAFEPATH",
+    "QT_PLUGIN_PATH",
+    "VTK_SILENCE_GET_VOID_POINTER_WARNINGS",
+)
+
+
+def _env_root_and_scripts(python_exe: Path) -> tuple[Path, Path]:
     py_dir = python_exe.resolve().parent
-    env_root = py_dir.parent if py_dir.name.lower() == "scripts" else py_dir
-    env["PYTHONHOME"] = str(env_root)
+    if py_dir.name.lower() == "scripts":
+        return py_dir.parent, py_dir
+    return py_dir, py_dir / "Scripts"
+
+
+def _native_bin_dirs(env_root: Path, scripts_dir: Path) -> list[Path]:
+    """
+    Directories conda/venv put next to python.exe so native extensions can
+    load. On Windows, SimpleITK's `_SimpleITK.pyd` needs Library/bin (ITK,
+    zlib, …). A Slicer-launched subprocess does not get `conda activate`,
+    so those dirs must be prepended to PATH or `import SimpleITK` fails
+    with "DLL load failed / 지정된 모듈을 찾을 수 없습니다".
+    """
+    return [
+        scripts_dir,
+        env_root,
+        env_root / "DLLs",
+        env_root / "Library" / "bin",
+        env_root / "Library" / "usr" / "bin",
+        env_root / "Library" / "mingw-w64" / "bin",
+        env_root / "bin",
+    ]
+
+
+def _is_virtualenv(env_root: Path) -> bool:
+    return (env_root / "pyvenv.cfg").is_file()
+
+
+def _venv_home(env_root: Path) -> Path | None:
+    """Base interpreter directory from pyvenv.cfg (uv/venv trampoline)."""
+    cfg = env_root / "pyvenv.cfg"
+    if not cfg.is_file():
+        return None
+    try:
+        text = cfg.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        if key.strip().lower() == "home":
+            p = Path(val.strip())
+            return p if p.is_dir() else None
+    return None
+
+
+def _has_stdlib(root: Path) -> bool:
+    return (root / "Lib" / "encodings").is_dir() or any(
+        root.glob("lib/python3*/encodings")
+    )
+
+
+def _env_for_external_python(python_exe: Path | str) -> dict:
+    """Env for a conda/venv interpreter launched from Slicer (no Slicer Python leak)."""
+    python_exe = Path(python_exe)
+    env = os.environ.copy()
+    for key in _SLICER_ENV_KEYS:
+        env.pop(key, None)
+
+    env_root, scripts_dir = _env_root_and_scripts(python_exe)
+    env["PYTHONUNBUFFERED"] = "1"
+
+    # uv/venv: .venv is a trampoline; stdlib lives in `home` from pyvenv.cfg.
+    # Setting PYTHONHOME to .venv → "No module named 'encodings'".
+    # conda prefix: PYTHONHOME is OK if encodings exist there.
+    is_venv = _is_virtualenv(env_root)
+    if is_venv:
+        env["VIRTUAL_ENV"] = str(env_root)
+        env.pop("CONDA_PREFIX", None)
+        env.pop("PYTHONHOME", None)
+    else:
+        env["CONDA_PREFIX"] = str(env_root)
+        if _has_stdlib(env_root):
+            env["PYTHONHOME"] = str(env_root)
+
+    front: list[str] = []
+    home = _venv_home(env_root) if is_venv else None
+    for p in (
+        *(_native_bin_dirs(home, home / "Scripts") if home is not None else []),
+        *_native_bin_dirs(env_root, scripts_dir),
+    ):
+        if p.is_dir():
+            s = str(p)
+            if s not in front:
+                front.append(s)
+
+    rest: list[str] = []
+    for part in env.get("PATH", "").split(os.pathsep):
+        if not part:
+            continue
+        low = part.replace("\\", "/").lower()
+        if "slicer.org" in low or "/3d slicer" in low or "/slicer " in low:
+            continue
+        if part not in front and part not in rest:
+            rest.append(part)
+    env["PATH"] = os.pathsep.join(front + rest)
     return env
 
 
@@ -339,46 +443,15 @@ class ModuleLauncherLogic(ScriptedLoadableModuleLogic):
                 "Progress lines should appear below; the 'total' task can still take several minutes."
             )
 
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
+        # Isolate from Slicer Python *and* prepend conda Library/bin so
+        # SimpleITK/torch DLLs load without a prior `conda activate`.
+        env = _env_for_external_python(python_exe)
         env["KUPETCTMS_EXTENSION_NEW"] = str(root)
 
-        # Slicer injects PYTHONPATH / PYTHONHOME → SRE module mismatch if leaked.
-        for key in (
-            "PYTHONPATH",
-            "PYTHONHOME",
-            "PYTHONSTARTUP",
-            "PYTHONNOUSERSITE",
-            "PYTHONUSERBASE",
-            "PYTHONSAFEPATH",
-            "QT_PLUGIN_PATH",
-            "VTK_SILENCE_GET_VOID_POINTER_WARNINGS",
-        ):
-            env.pop(key, None)
-
-        py_dir = Path(python_exe).resolve().parent
-        env_root = py_dir
-        scripts_dir = py_dir / "Scripts"
-        if py_dir.name.lower() == "scripts":
-            env_root = py_dir.parent
-            scripts_dir = py_dir
-        env["PYTHONHOME"] = str(env_root)
-
-        path_parts = []
-        for part in (scripts_dir, env_root, *env.get("PATH", "").split(os.pathsep)):
-            if not part:
-                continue
-            part_s = str(part)
-            low = part_s.replace("\\", "/").lower()
-            if "slicer.org" in low or "/3d slicer" in low:
-                continue
-            if part_s not in path_parts:
-                path_parts.append(part_s)
-        env["PATH"] = os.pathsep.join(path_parts)
-
         if log_cb:
-            log_cb(f"PYTHONHOME={env.get('PYTHONHOME')}")
-            log_cb("Cleared Slicer PYTHONPATH/PYTHONHOME for subprocess.")
+            ph = env.get("PYTHONHOME") or "(unset, uv/venv trampoline)"
+            log_cb(f"PYTHONHOME={ph}")
+            log_cb("Cleared Slicer PYTHONPATH; not forcing PYTHONHOME on virtualenvs.")
 
         proc = subprocess.Popen(
             cmd,
