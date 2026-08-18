@@ -25,9 +25,16 @@ When someone installs this package, **core dependencies are pulled automatically
 
 ### Local development (this repo)
 
+This repo includes **`uv.lock`** + **`.python-version`** (3.11) so everyone gets the same resolved versions.
+
 ```bash
-cd extension_new
-uv sync --extra full          # or: pip install -e ".[full]"
+cd extension_new   # or repo root on the TEST branch
+uv sync --frozen --extra full   # exact lockfile install (preferred after pull)
+# first-time / refresh lock only when deps change:
+#   uv lock
+#   uv sync --extra full
+# pip fallback (not locked):
+#   pip install -e ".[full]"
 ```
 
 ### Optional extras

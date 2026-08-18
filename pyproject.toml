@@ -58,6 +58,6 @@ where = ["."]
 include = ["lib*"]
 
 [tool.uv]
-# `uv sync` installs the project + default dependencies.
-# Extras:  uv sync --extra full
+# Locked by uv.lock (commit it). Collaborators: uv sync --frozen --extra full
+# Extras:  uv sync --extra full   |   uv sync --extra seg --extra radiomics
 default-groups = []
