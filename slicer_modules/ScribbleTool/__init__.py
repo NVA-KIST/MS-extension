@@ -1,1 +1,0 @@
-"""ScribbleTool package."""

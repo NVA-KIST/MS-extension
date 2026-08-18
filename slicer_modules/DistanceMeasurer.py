@@ -16,11 +16,11 @@ from slicer.ScriptedLoadableModule import (
 )
 
 try:
-    from DistanceMeasurerLogic import DistanceMeasurerLogic
+    from DistanceMeasurerLib.DistanceMeasurerLogic import DistanceMeasurerLogic
 except ImportError:
     import importlib.util
 
-    _p = os.path.join(os.path.dirname(__file__), "DistanceMeasurerLogic.py")
+    _p = os.path.join(os.path.dirname(__file__), "DistanceMeasurerLib", "DistanceMeasurerLogic.py")
     _spec = importlib.util.spec_from_file_location("DistanceMeasurerLogic", _p)
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)

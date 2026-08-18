@@ -44,10 +44,10 @@ _PALETTE = [
 
 
 try:
-    from ScribbleToolLogic import ScribbleToolLogic
+    from ScribbleToolLib.ScribbleToolLogic import ScribbleToolLogic
 except ImportError:
     import importlib.util, os as _os
-    _p = _os.path.join(_os.path.dirname(__file__), "ScribbleToolLogic.py")
+    _p = _os.path.join(_os.path.dirname(__file__), "ScribbleToolLib", "ScribbleToolLogic.py")
     _spec = importlib.util.spec_from_file_location("ScribbleToolLogic", _p)
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)

@@ -53,10 +53,10 @@ from slicer.ScriptedLoadableModule import (
 
 
 try:
-    from VesselSegmenterLogic import VesselSegmenterLogic
+    from VesselSegmenterLib.VesselSegmenterLogic import VesselSegmenterLogic
 except ImportError:
     import importlib.util, os as _os
-    _p = _os.path.join(_os.path.dirname(__file__), "VesselSegmenterLogic.py")
+    _p = _os.path.join(_os.path.dirname(__file__), "VesselSegmenterLib", "VesselSegmenterLogic.py")
     _spec = importlib.util.spec_from_file_location("VesselSegmenterLogic", _p)
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)

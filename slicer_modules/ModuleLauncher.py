@@ -91,10 +91,10 @@ _MODULES = [
 
 
 try:
-    from ModuleLauncherLogic import ModuleLauncherLogic
+    from ModuleLauncherLib.ModuleLauncherLogic import ModuleLauncherLogic
 except ImportError:
     import importlib.util, os as _os
-    _p = _os.path.join(_os.path.dirname(__file__), "ModuleLauncherLogic.py")
+    _p = _os.path.join(_os.path.dirname(__file__), "ModuleLauncherLib", "ModuleLauncherLogic.py")
     _spec = importlib.util.spec_from_file_location("ModuleLauncherLogic", _p)
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)

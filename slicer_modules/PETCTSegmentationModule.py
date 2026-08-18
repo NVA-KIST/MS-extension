@@ -3,16 +3,11 @@ PETCTSegmentationModule — Slicer entry (Module metadata + Widget UI/triggers).
 
 Logic: PETCTSegmentationModuleLogic.py → lib/io + lib/segmentation + mirroring.
 PLog / BatchPatient / steps persistence: lib/io/logging_utils + batch_patient.
-"""
-"""
-PETCTSegmentationModule — 3D Slicer Scripted Module
-====================================================
+
 Semi-automatic, batch-oriented KU protocol PET-CT pre-processing &
 segmentation module.
-Modules → Workflow → PETCT Segmentation Module
+Modules → Metabolic Syndrome Toolkit → PETCT Segmentation Module
 
-This module is the result of dissolving the old monolithic
-"KU PET-CT Pipeline" wizard into 5 separate, purpose-specific modules.
 This module covers ONLY the first 3 steps of the old wizard (CT
 pre-processing, TotalSegmentator, visceral-fat prediction, and mirroring
 QC). The remaining steps now live in their own modules:
@@ -61,7 +56,6 @@ Every method logs to:
   • root/pipeline_logs/{patient_key}.log  (one file per patient, appended)
 Log fields: timestamp · level · patient key · message
 """
-
 from __future__ import annotations
 
 import os, re, json, threading, traceback, logging, subprocess, time
@@ -243,10 +237,10 @@ def _nz(arr: np.ndarray) -> int:
 
 
 try:
-    from PETCTSegmentationModuleLogic import PETCTSegmentationModuleLogic
+    from PETCTSegmentationModuleLib.PETCTSegmentationModuleLogic import PETCTSegmentationModuleLogic
 except ImportError:
     import importlib.util, os as _os
-    _p = _os.path.join(_os.path.dirname(__file__), "PETCTSegmentationModuleLogic.py")
+    _p = _os.path.join(_os.path.dirname(__file__), "PETCTSegmentationModuleLib", "PETCTSegmentationModuleLogic.py")
     _spec = importlib.util.spec_from_file_location("PETCTSegmentationModuleLogic", _p)
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)

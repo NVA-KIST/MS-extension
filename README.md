@@ -212,6 +212,27 @@ Affines are 4×4 matrices mapping index `(i, j, k) = (X, Y, Z)` → RAS mm.
 
 ---
 
+## 3D Slicer setup (important)
+
+Slicer only auto-loads **top-level `*.py` module files** in an Additional Module Path.
+Use this exact folder (not `extension_new`, not the old flat `extension/` tree):
+
+```
+E:\KUPETCTMS\extension\extension_new\slicer_modules
+```
+
+Steps:
+1. **Edit → Application Settings → Modules → Additional module paths → Add**
+2. Select `...\extension_new\slicer_modules`
+3. **Restart Slicer** (required after adding/changing paths)
+4. Open **Modules → Metabolic Syndrome Toolkit**
+
+You should see Module Launcher, numbered clinical modules, Scribble Tool, PET Biomarker Studio.
+
+If a module is missing, check **Application Settings → Modules** for a “Failed to load” / ignored list and clear it, then restart.
+
+---
+
 ## Publishing note
 
 Today internal imports are `from lib....`. After a public rename you would use `from kupetctms....` and keep a compatibility shim. Do not rename until you are ready to update every import and Slicer adapter.

@@ -1,5 +1,5 @@
 """
-PETCTQuantAnalysis_v2Logic — Slicer adapter.
+PETCTQuantAnalysisLogic — Slicer adapter.
 
 lib: paths discovery, excel export, SUVbw factor math
 Logic (Slicer): DICOM load, registration, QuantitativeIndicesCLI, volume update
@@ -31,7 +31,7 @@ from lib.quantification.pet_metrics import (
 )
 
 
-class PETCTQuantAnalysis_v2Logic(ScriptedLoadableModuleLogic):
+class PETCTQuantAnalysisLogic(ScriptedLoadableModuleLogic):
 
     # ── Logging helper ────────────────────────────────────────────────────
 

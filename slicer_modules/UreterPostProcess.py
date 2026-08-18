@@ -50,10 +50,10 @@ def _default_mode(filename):
 
 
 try:
-    from UreterPostProcessLogic import UreterPostProcessLogic
+    from UreterPostProcessLib.UreterPostProcessLogic import UreterPostProcessLogic
 except ImportError:
     import importlib.util, os as _os
-    _p = _os.path.join(_os.path.dirname(__file__), "UreterPostProcessLogic.py")
+    _p = _os.path.join(_os.path.dirname(__file__), "UreterPostProcessLib", "UreterPostProcessLogic.py")
     _spec = importlib.util.spec_from_file_location("UreterPostProcessLogic", _p)
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)

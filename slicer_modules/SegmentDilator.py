@@ -49,10 +49,10 @@ from slicer.ScriptedLoadableModule import (
 
 
 try:
-    from SegmentDilatorLogic import SegmentDilatorLogic
+    from SegmentDilatorLib.SegmentDilatorLogic import SegmentDilatorLogic
 except ImportError:
     import importlib.util, os as _os
-    _p = _os.path.join(_os.path.dirname(__file__), "SegmentDilatorLogic.py")
+    _p = _os.path.join(_os.path.dirname(__file__), "SegmentDilatorLib", "SegmentDilatorLogic.py")
     _spec = importlib.util.spec_from_file_location("SegmentDilatorLogic", _p)
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)

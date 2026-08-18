@@ -1,1 +1,0 @@
-# PETBiomarkerStudio Slicer module package

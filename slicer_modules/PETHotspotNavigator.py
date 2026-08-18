@@ -31,11 +31,11 @@ LOG = logging.getLogger("PETHotspotNav")
 
 # Import sibling Logic (works when Slicer loads this file by path)
 try:
-    from PETHotspotNavigatorLogic import PETHotspotNavigatorLogic
+    from PETHotspotNavigatorLib.PETHotspotNavigatorLogic import PETHotspotNavigatorLogic
 except ImportError:
     import importlib.util
 
-    _p = os.path.join(os.path.dirname(__file__), "PETHotspotNavigatorLogic.py")
+    _p = os.path.join(os.path.dirname(__file__), "PETHotspotNavigatorLib", "PETHotspotNavigatorLogic.py")
     _spec = importlib.util.spec_from_file_location("PETHotspotNavigatorLogic", _p)
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)

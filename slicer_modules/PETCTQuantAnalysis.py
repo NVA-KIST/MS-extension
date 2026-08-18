@@ -52,16 +52,16 @@ _DEFAULT_SKIP = {
 
 
 try:
-    from PETCTQuantAnalysis_v2Logic import PETCTQuantAnalysis_v2Logic
+    from PETCTQuantAnalysisLib.PETCTQuantAnalysisLogic import PETCTQuantAnalysisLogic
 except ImportError:
     import importlib.util, os as _os
-    _p = _os.path.join(_os.path.dirname(__file__), "PETCTQuantAnalysis_v2Logic.py")
-    _spec = importlib.util.spec_from_file_location("PETCTQuantAnalysis_v2Logic", _p)
+    _p = _os.path.join(_os.path.dirname(__file__), "PETCTQuantAnalysisLib", "PETCTQuantAnalysisLogic.py")
+    _spec = importlib.util.spec_from_file_location("PETCTQuantAnalysisLogic", _p)
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
-    PETCTQuantAnalysis_v2Logic = getattr(_mod, "PETCTQuantAnalysis_v2Logic")
+    PETCTQuantAnalysisLogic = getattr(_mod, "PETCTQuantAnalysisLogic")
 
-class PETCTQuantAnalysis_v2(ScriptedLoadableModule):
+class PETCTQuantAnalysis(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         parent.title       = "7. Quantitative Analysis"
@@ -75,11 +75,11 @@ class PETCTQuantAnalysis_v2(ScriptedLoadableModule):
         )
 
 
-class PETCTQuantAnalysis_v2Widget(ScriptedLoadableModuleWidget):
+class PETCTQuantAnalysisWidget(ScriptedLoadableModuleWidget):
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
-        self.logic = PETCTQuantAnalysis_v2Logic()
+        self.logic = PETCTQuantAnalysisLogic()
         self._scans = []          # list of scan dicts from detectScans
         self._seg_rows = []       # list of (stem, cb_widget, name_edit)
 
