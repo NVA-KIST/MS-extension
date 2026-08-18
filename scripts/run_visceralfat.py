@@ -215,11 +215,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.limit > 0:
         patients = patients[: args.limit]
 
+    n_err = 0
     for i, pat in enumerate(patients, 1):
         key = f"{pat['subject_id']}_{pat['scan_date']}"
         print(f"\n######## [{i}/{len(patients)}] {key} ########")
         ct_nii = _ensure_ct_nii(pat, args.root, print)
         if ct_nii is None:
+            n_err += 1
             continue
         seg_dir = Path(pat["seg_path"])
         try:
@@ -235,13 +237,14 @@ def main(argv: list[str] | None = None) -> int:
                 auto_orient=not args.no_auto_orient,
             )
         except Exception as e:
+            n_err += 1
             print(f"  [ERROR] {key}: {e}")
             import traceback
 
             traceback.print_exc()
 
     print("\nBatch finished.")
-    return 0
+    return 1 if n_err else 0
 
 
 if __name__ == "__main__":

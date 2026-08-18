@@ -72,13 +72,25 @@ def run_totalsegmentator_api(input_path: Path | str, output_dir: Path | str, **k
     call_kwargs: dict[str, Any] = dict(kwargs)
     if "device" not in call_kwargs:
         call_kwargs["device"] = "gpu"
+    # Match CLI default: --fast for the total task unless caller overrides.
+    if "fast" not in call_kwargs and call_kwargs.get("task", "total") == "total":
+        call_kwargs["fast"] = True
     try:
+        print(f"[TS] API start task={call_kwargs.get('task')} device={call_kwargs.get('device')} "
+              f"fast={call_kwargs.get('fast')}", flush=True)
         totalsegmentator(str(input_path), str(output_dir), **call_kwargs)
+        print(f"[TS] API done task={call_kwargs.get('task')}", flush=True)
     except TypeError as exc:
-        if "unexpected keyword argument 'device'" not in str(exc):
-            raise
-        call_kwargs.pop("device", None)
-        totalsegmentator(str(input_path), str(output_dir), **call_kwargs)
+        msg = str(exc)
+        if "unexpected keyword argument 'device'" in msg:
+            call_kwargs.pop("device", None)
+            totalsegmentator(str(input_path), str(output_dir), **call_kwargs)
+            return
+        if "unexpected keyword argument 'fast'" in msg:
+            call_kwargs.pop("fast", None)
+            totalsegmentator(str(input_path), str(output_dir), **call_kwargs)
+            return
+        raise
 
 
 def run_totalsegmentator_cli(
@@ -92,18 +104,19 @@ def run_totalsegmentator_cli(
     log=None,
 ) -> None:
     """CLI-based TS used by the Slicer pipeline. Port of Logic.runTS."""
+    import sys
 
     def _info(msg: str):
         if log is not None and hasattr(log, "info"):
             log.info(msg)
         else:
-            print(f"[TS] {msg}")
+            print(f"[TS] {msg}", flush=True)
 
     def _warn(msg: str):
         if log is not None and hasattr(log, "warn"):
             log.warn(msg)
         else:
-            print(f"[TS][WARN] {msg}")
+            print(f"[TS][WARN] {msg}", flush=True)
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -128,15 +141,44 @@ def run_totalsegmentator_cli(
             return
         _warn(f"Re-running '{task}': missing/invalid {missing[:8]}")
 
-    cmd = [ts_cmd, "-i", ct_nii, "-o", out_dir, "--task", task, "--device", gpu]
+    args = ["-i", ct_nii, "-o", out_dir, "--task", task, "--device", str(gpu)]
     if ts_fast and task not in _NO_FAST_TASKS:
-        cmd.append("--fast")
+        args.append("--fast")
     elif ts_fast and task in _NO_FAST_TASKS:
         _warn(f"--fast ignored for task '{task}'")
 
+    # Windows conda TotalSegmentator.exe is often a broken stub (exit 1, no
+    # stdout/stderr). Prefer the same interpreter's Python entry point.
+    use_py_entry = False
+    try:
+        import totalsegmentator  # noqa: F401
+        use_py_entry = Path(sys.executable).is_file()
+    except Exception:
+        use_py_entry = False
+
+    if use_py_entry:
+        bootstrap = (
+            "import sys; "
+            "from totalsegmentator.bin.TotalSegmentator import main; "
+            "sys.argv=['TotalSegmentator']+sys.argv[1:]; "
+            "raise SystemExit(main() or 0)"
+        )
+        cmd = [sys.executable, "-u", "-c", bootstrap, *args]
+    else:
+        cmd = [ts_cmd, *args]
+
     _info(" ".join(cmd))
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
     )
     lines = []
     assert proc.stdout is not None
@@ -147,9 +189,9 @@ def run_totalsegmentator_cli(
             lines.append(line)
     proc.wait()
     if proc.returncode != 0:
+        tail = "\n".join(lines[-40:]) if lines else "(no output captured)"
         raise RuntimeError(
-            f"TotalSegmentator '{task}' failed (exit {proc.returncode})\n"
-            + "\n".join(lines[-30:])
+            f"TotalSegmentator '{task}' failed (exit {proc.returncode})\n{tail}"
         )
 
 
@@ -161,25 +203,51 @@ def run_totalseg_for_visceral_fat(
     include_targets: bool = True,
     include_vessels: bool = True,
     include_abdomen: bool = True,
-    use_api: bool = True,
+    use_api: bool | None = None,
+    ts_cmd: str = "TotalSegmentator",
     log=None,
 ) -> Path:
     """
     Run the TS tasks needed for VF + target organs + abdomen + optional vessels.
 
     Tasks:
-      1. total  (ROI subset: VF anatomy + psoas/spleen + abdomen + vessels)
+      1. total  (ROI subset via API, or full total via CLI --fast)
       2. body   → body_trunc
       3. tissue_types → torso_fat  (needs academic licence)
+
+    Prefers the TotalSegmentator CLI when available (streams progress, uses --fast).
+    Set use_api=True to force the Python API (still uses fast=True for total).
     """
+    import shutil
+
     ct_path = Path(ct_path)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     def _info(msg: str):
-        print(msg) if log is None else (
-            log.info(msg) if hasattr(log, "info") else print(msg)
-        )
+        line = msg if isinstance(msg, str) else str(msg)
+        if log is None:
+            print(line, flush=True)
+        elif hasattr(log, "info"):
+            log.info(line)
+        else:
+            print(line, flush=True)
+
+    if use_api is None:
+        # Prefer subprocess CLI via current Python entrypoint (not the often-broken
+        # Windows TotalSegmentator.exe stub). Fall back to in-process API only if
+        # totalsegmentator cannot be imported here.
+        try:
+            import totalsegmentator  # noqa: F401
+            use_api = False
+            _info("[TS] mode=CLI (python -c totalsegmentator.bin.TotalSegmentator)")
+        except Exception:
+            if shutil.which(ts_cmd):
+                use_api = False
+                _info(f"[TS] mode=CLI (executable {ts_cmd})")
+            else:
+                use_api = True
+                _info("[TS] mode=API (TotalSegmentator not importable / not on PATH)")
 
     rois = list(VF_TOTAL_ROIS)
     if include_targets:
@@ -200,12 +268,14 @@ def run_totalseg_for_visceral_fat(
             task="total",
             roi_subset=rois,
             device=device,
+            fast=True,
             nr_thr_resamp=1,
             nr_thr_saving=1,
         )
     else:
         run_totalsegmentator_cli(
-            str(ct_path), str(out_dir), "total", gpu=device, ts_fast=True, log=log
+            str(ct_path), str(out_dir), "total",
+            ts_cmd=ts_cmd, gpu=device, ts_fast=True, log=log,
         )
 
     for task in ("body", "tissue_types"):
@@ -217,7 +287,8 @@ def run_totalseg_for_visceral_fat(
                 run_totalsegmentator_api(ct_path, task_tmp, task=task, device=device)
             else:
                 run_totalsegmentator_cli(
-                    str(ct_path), str(task_tmp), task, gpu=device, ts_fast=False, log=log
+                    str(ct_path), str(task_tmp), task,
+                    ts_cmd=ts_cmd, gpu=device, ts_fast=False, log=log,
                 )
             for fname in os.listdir(task_tmp):
                 if fname.endswith(".nii.gz"):

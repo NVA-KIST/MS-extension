@@ -25,8 +25,15 @@ _LOADED = False
 
 
 def default_vf_checkpoint() -> Path:
-    """Recommended VF weights used by VFInference / run_visceralfat."""
-    return _ROOT / "epoch=399-step=8800.ckpt"
+    """
+    Recommended VF weights used by VFInference / run_visceralfat.
+    Prefers epoch=399-step=8800.ckpt if present; else newest *.ckpt in this folder.
+    """
+    preferred = _ROOT / "epoch=399-step=8800.ckpt"
+    if preferred.is_file():
+        return preferred
+    ckpts = sorted(_ROOT.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return ckpts[0] if ckpts else preferred
 
 
 def _ensure_loaded() -> None:

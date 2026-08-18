@@ -211,6 +211,17 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
             self.pipeCkptEdit.setCurrentPath(default_ckpt)
         form.addRow("VF checkpoint:", self.pipeCkptEdit)
 
+        self.pipePythonEdit = ctk.ctkPathLineEdit()
+        self.pipePythonEdit.filters = ctk.ctkPathLineEdit.Files
+        self.pipePythonEdit.nameFilters = ["Python (python.exe python*)", "All files (*)"]
+        self.pipePythonEdit.setToolTip(
+            "External Python that has TotalSegmentator + torch (NOT Slicer's Python).\n"
+            "Example: .../miniconda3/envs/kupetct/python.exe")
+        default_py = self.logic.default_pipeline_python()
+        if default_py:
+            self.pipePythonEdit.setCurrentPath(default_py)
+        form.addRow("Pipeline Python:", self.pipePythonEdit)
+
         self.pipeDeviceEdit = qt.QLineEdit("gpu")
         self.pipeDeviceEdit.setToolTip("'gpu', 'cpu', or device index like '0'.")
         form.addRow("Device:", self.pipeDeviceEdit)
@@ -250,7 +261,19 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
             "QPushButton:hover{background:#1565c0;}"
             "QPushButton:disabled{background:#90a4ae;}")
         self.pipeRunBtn.clicked.connect(self._on_run_pipeline)
-        form.addRow("", self.pipeRunBtn)
+
+        self.pipeStopBtn = qt.QPushButton("Stop")
+        self.pipeStopBtn.setEnabled(False)
+        self.pipeStopBtn.setStyleSheet(
+            "QPushButton{background:#b71c1c;color:white;font-weight:bold;"
+            "padding:8px;border-radius:4px;}"
+            "QPushButton:disabled{background:#90a4ae;}")
+        self.pipeStopBtn.clicked.connect(self._on_stop_pipeline)
+
+        btnRow = qt.QHBoxLayout()
+        btnRow.addWidget(self.pipeRunBtn, 1)
+        btnRow.addWidget(self.pipeStopBtn)
+        form.addRow("", btnRow)
 
         self.pipeStatus = qt.QLabel("Idle.")
         self.pipeStatus.setStyleSheet("color:#666; font-style:italic;")
@@ -374,6 +397,7 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
             "src": self.pipeSrcEdit.currentPath,
             "out": self.pipeOutEdit.currentPath,
             "ckpt": self.pipeCkptEdit.currentPath,
+            "python": self.pipePythonEdit.currentPath,
             "device": self.pipeDeviceEdit.text.strip(),
             "limit": int(self.pipeLimitSpin.value),
             "skip_seg": bool(self.pipeSkipSeg.checked),
@@ -384,12 +408,18 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
             "no_append": bool(self.pipeNoAppend.checked),
         }
 
+    def _on_stop_pipeline(self):
+        self.logic.stop_pipeline()
+        self.pipeStatus.setText("Stopping…")
+        self.pipeStatus.setStyleSheet("color:#e65100; font-weight:bold;")
+
     def _on_run_pipeline(self):
         import os
 
         opts = self._pipeline_opts_from_ui()
         root = (opts["root"] or "").strip()
         out = (opts["out"] or "").strip()
+        py = (opts["python"] or "").strip()
 
         if not root or not os.path.isdir(root):
             slicer.util.errorDisplay(
@@ -399,6 +429,13 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
         if not out:
             slicer.util.errorDisplay(
                 "Select an Output Excel path (.xlsx).",
+                windowTitle="Run Pipeline")
+            return
+        if not py or not os.path.isfile(py):
+            slicer.util.errorDisplay(
+                "Select Pipeline Python (conda env with TotalSegmentator),\n"
+                "e.g. .../miniconda3/envs/kupetct/python.exe\n"
+                "Do not use Slicer's Python.",
                 windowTitle="Run Pipeline")
             return
         if not opts["skip_seg"]:
@@ -421,6 +458,7 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
         self.pipeStatus.setText("Running…")
         self.pipeStatus.setStyleSheet("color:#0d47a1; font-weight:bold;")
         self.pipeRunBtn.setEnabled(False)
+        self.pipeStopBtn.setEnabled(True)
 
         def _log(msg):
             with self._pipe_log_lock:
@@ -432,6 +470,7 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
         ok = self.logic.run_pipeline_async(opts, log_cb=_log, done_cb=_done)
         if not ok:
             self.pipeRunBtn.setEnabled(True)
+            self.pipeStopBtn.setEnabled(False)
             self.pipeStatus.setText("Already running.")
             slicer.util.warningDisplay(
                 "A pipeline run is already in progress.",
@@ -452,6 +491,7 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
         self._pipe_poll.stop()
         rc, err = done
         self.pipeRunBtn.setEnabled(True)
+        self.pipeStopBtn.setEnabled(False)
         if err:
             self.pipeStatus.setText(f"Failed (exception). exit={rc}")
             self.pipeStatus.setStyleSheet("color:#b71c1c; font-weight:bold;")

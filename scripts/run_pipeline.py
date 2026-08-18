@@ -317,6 +317,13 @@ def main(argv=None) -> int:
     if not args.skip_seg:
         rc = run_segmentation(args)
         total_rc = max(total_rc, rc)
+        if rc != 0:
+            print("\n[Stage 1 FAILED] Skipping post + quant. Fix TotalSegmentator / masks first.")
+            _banner("Pipeline complete")
+            print(f"  Total wall time : {_elapsed(t_total)}")
+            print(f"  Exit code       : {total_rc}")
+            print()
+            return total_rc
     else:
         print("\n[Stage 1 SKIPPED]")
 
