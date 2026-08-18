@@ -1,11 +1,8 @@
 """
 SegResNet / SegResNetVAE / SPADESegResNet used by visceral-fat inference.
 
-Re-exports the real network definitions from ``extension/segresnet.py``
-(MONAI-based; same file VFInference.py and visceral_fat_segmentations.py load).
-
-Checkpoint (Lightning):
-  ``extension/models/epoch=399-step=8800.ckpt``
+Loads the network definitions from ``segresnet_full.py`` (MONAI-based).
+Checkpoint (Lightning): ``models/epoch=399-step=8800.ckpt`` (same folder)
 
 Torch/MONAI are imported lazily so checkpoint path helpers work without GPU deps.
 """
@@ -20,18 +17,16 @@ __all__ = [
     "SegResNetVAE",
     "SPADESegResNet",
     "default_vf_checkpoint",
-    "EXTENSION_ROOT",
 ]
 
-# lib/models/segresnet.py → parents[3] == extension/
-EXTENSION_ROOT = Path(__file__).resolve().parents[3]
-_SRC = EXTENSION_ROOT / "segresnet.py"
+_ROOT = Path(__file__).resolve().parent  # lib/models/
+_SRC = _ROOT / "segresnet_full.py"
 _LOADED = False
 
 
 def default_vf_checkpoint() -> Path:
     """Recommended VF weights used by VFInference / run_visceralfat."""
-    return EXTENSION_ROOT / "models" / "epoch=399-step=8800.ckpt"
+    return _ROOT / "epoch=399-step=8800.ckpt"
 
 
 def _ensure_loaded() -> None:

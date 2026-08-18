@@ -1,8 +1,7 @@
 """Model definitions and checkpoint path helpers."""
-from lib.models.segresnet import EXTENSION_ROOT, default_vf_checkpoint
+from lib.models.segresnet import default_vf_checkpoint
 
 __all__ = [
-    "EXTENSION_ROOT",
     "SegResNet",
     "SegResNetVAE",
     "SPADESegResNet",

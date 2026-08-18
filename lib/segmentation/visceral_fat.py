@@ -35,20 +35,20 @@ def _fallback_log():
 
 
 def _import_segresnet(log):
-    """Prefer lib.models.segresnet (re-exports extension/segresnet.py)."""
+    """Import SegResNet from lib.models.segresnet (loads segresnet_full.py)."""
     try:
         from lib.models.segresnet import SegResNet, default_vf_checkpoint
 
         ckpt = default_vf_checkpoint()
-        log.info(f"SegResNet from lib.models.segresnet (ckpt hint: {ckpt})")
+        log.info(f"SegResNet from lib.models.segresnet (ckpt: {ckpt})")
         return SegResNet
     except Exception as e:
-        log.warn(f"lib.models.segresnet unavailable ({e}); trying file fallback")
+        log.warn(f"lib.models.segresnet unavailable ({e}); trying fallback")
 
     here = Path(__file__).resolve()
     candidates = [
-        here.parents[3] / "segresnet.py",  # extension/segresnet.py
-        here.parents[2].parent / "segresnet.py",
+        here.parents[2] / "models" / "segresnet_full.py",  # lib/models/segresnet_full.py
+        here.parents[3] / "segresnet.py",  # fallback: extension/segresnet.py (old location)
     ]
     for path in candidates:
         if path.is_file() and path.stat().st_size > 1000:
@@ -64,8 +64,8 @@ def _import_segresnet(log):
             except Exception as err:
                 log.warn(f"Could not load {path}: {err}")
     raise ImportError(
-        "Could not import SegResNet. Expected extension/segresnet.py "
-        "(wired via lib/models/segresnet.py)."
+        "Could not import SegResNet. Expected lib/models/segresnet_full.py "
+        "or extension/segresnet.py (wired via lib/models/segresnet.py)."
     )
 
 

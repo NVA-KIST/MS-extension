@@ -13,12 +13,16 @@ Expected dataset layout (same as the Slicer pipeline)::
 Usage
 -----
     cd extension_new
-    python scripts/run_visceralfat.py --root D:\\data\\dataset_clean ^
-        --ckpt E:\\KUPETCTMS\\extension\\models\\epoch=399-step=8800.ckpt
+    # Uses default checkpoint from lib/models/
+    python scripts/run_visceralfat.py --root D:\\data\\dataset_clean
 
-    # single CT NIfTI smoke test
-    python scripts/run_visceralfat.py --ct path\\to\\ct.nii.gz --seg-dir path\\to\\out \\
-        --ckpt path\\to\\ckpt
+    # Custom checkpoint path
+    python scripts/run_visceralfat.py --root D:\\data\\dataset_clean ^
+        --ckpt path\\to\\custom\\checkpoint.ckpt
+
+    # single CT NIfTI smoke test (requires --ckpt)
+    python scripts/run_visceralfat.py --ct path\\to\\ct.nii.gz --seg-dir path\\to\\out ^
+        --ckpt path\\to\\checkpoint.ckpt
 """
 from __future__ import annotations
 
@@ -157,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         "--ckpt",
         type=Path,
         default=None,
-        help="SegResNet checkpoint (default: extension/models/epoch=399-step=8800.ckpt)",
+        help="SegResNet checkpoint (default: lib/models/epoch=399-step=8800.ckpt)",
     )
     p.add_argument("--device", default="gpu", help="gpu | cpu | 0")
     p.add_argument("--cuda", default=None, help="Set CUDA_VISIBLE_DEVICES")

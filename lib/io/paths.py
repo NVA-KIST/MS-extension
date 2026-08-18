@@ -134,22 +134,26 @@ def discover_patients(root: str) -> list[dict[str, Any]]:
     Returns list of {subject_id, scan_date, ct_path, pet_path, seg_path, ct_nii?}.
     """
     scans = []
-    # Prefer PET-driven discovery (same as detect_scans) but tolerate missing PET
+    # Union of CT/ and PET/ so CT-only or PET-only studies are not dropped
     ct_root = os.path.join(root, "CT")
     pet_root = os.path.join(root, "PET")
     seg_root = os.path.join(root, "Segments")
-    source = pet_root if os.path.isdir(pet_root) else ct_root
-    if not os.path.isdir(source):
+    keys: dict[tuple[str, str], None] = {}
+    for source in (pet_root, ct_root):
+        if not os.path.isdir(source):
+            continue
+        for folder in sorted(os.listdir(source)):
+            fpath = os.path.join(source, folder)
+            if not os.path.isdir(fpath):
+                continue
+            parsed = parse_folder_name(folder)
+            if not parsed:
+                continue
+            keys[(parsed[0], parsed[1])] = None
+    if not keys and not os.path.isdir(pet_root) and not os.path.isdir(ct_root):
         raise FileNotFoundError(f"No PET/ or CT/ under {root}")
 
-    for folder in sorted(os.listdir(source)):
-        fpath = os.path.join(source, folder)
-        if not os.path.isdir(fpath):
-            continue
-        parsed = parse_folder_name(folder)
-        if not parsed:
-            continue
-        subj, date, _ = parsed
+    for subj, date in keys:
         ct_p = os.path.join(ct_root, f"{subj}_{date}_CT")
         pet_p = os.path.join(pet_root, f"{subj}_{date}_PET")
         seg_p = os.path.join(seg_root, f"{subj}_{date}_Seg")

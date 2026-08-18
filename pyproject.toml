@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kupetctms"
+version = "0.1.0"
+description = "KU PET/CT pipeline: TotalSegmentator + visceral fat, KU post-processing, SUV/radiomics quantification."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "KUPETCTMS" }]
+keywords = ["PET", "CT", "segmentation", "SUV", "radiomics", "TotalSegmentator"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+
+# Installed automatically by:  pip install .   /   uv sync   /   uv add kupetctms
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "nibabel>=5.0",
+  "SimpleITK>=2.3",
+  "pydicom>=2.4",
+  "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+# Stage 1 — TotalSegmentator + SegResNet VF
+seg = [
+  "TotalSegmentator>=2.4",
+  "torch>=2.0",
+  "monai>=1.3",
+  "lightning>=2.0",
+]
+# Stage 3 — PyRadiomics features
+radiomics = [
+  "pyradiomics>=3.1",
+]
+# Everything needed for the full CLI pipeline
+full = [
+  "kupetctms[seg,radiomics]",
+]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/YOUR_ORG/kupetctms"
+Documentation = "docs/API.md"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lib*"]
+
+[tool.uv]
+# `uv sync` installs the project + default dependencies.
+# Extras:  uv sync --extra full
+default-groups = []
