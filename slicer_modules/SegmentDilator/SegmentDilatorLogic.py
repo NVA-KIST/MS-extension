@@ -239,7 +239,6 @@ class SegmentDilatorLogic(ScriptedLoadableModuleLogic):
     # ── Bulk helpers ──────────────────────────────────────────────────────────
 
     @staticmethod
-    @staticmethod
     def _stem(filename):
         return lib_file_stem(filename)
 
@@ -342,6 +341,7 @@ class SegmentDilatorLogic(ScriptedLoadableModuleLogic):
         return lib_resample_to_target(src_arr, src_affine, tgt_shape, tgt_affine)
 
 
+    @staticmethod
     def _mat_to_np(mat):
         import numpy as np
         return np.array([[mat.GetElement(r, c) for c in range(4)]

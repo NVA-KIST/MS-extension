@@ -136,7 +136,7 @@ class ScribbleTool(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         self.parent.title        = "Scribble Tool"
-        self.parent.categories   = ["Utilities"]
+        self.parent.categories   = ["Metabolic Syndrome Toolkit"]
         self.parent.dependencies = []
         self.parent.contributors = ["IshitaSinghFaujdar"]
         self.parent.helpText = (

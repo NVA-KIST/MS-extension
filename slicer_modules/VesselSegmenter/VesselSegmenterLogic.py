@@ -132,29 +132,6 @@ class VesselSegmenterLogic(ScriptedLoadableModuleLogic):
     def _draw_bridge(self, mask, p1, p2, radius_vox):
         return lib_draw_bridge(mask, p1, p2, radius_vox)
 
-
-        n_steps = max(3, int(np.ceil(dist)) * 2)
-        r2      = radius_vox ** 2
-
-        for t in np.linspace(0.0, 1.0, n_steps):
-            pt = p1 + t * vec
-            cz = int(round(float(pt[0])))
-            cy = int(round(float(pt[1])))
-            cx = int(round(float(pt[2])))
-
-            z0 = max(0, cz - radius_vox);  z1 = min(nz, cz + radius_vox + 1)
-            y0 = max(0, cy - radius_vox);  y1 = min(ny, cy + radius_vox + 1)
-            x0 = max(0, cx - radius_vox);  x1 = min(nx, cx + radius_vox + 1)
-
-            zz = np.arange(z0, z1) - cz
-            yy = np.arange(y0, y1) - cy
-            xx = np.arange(x0, x1) - cx
-            ZZ, YY, XX = np.meshgrid(zz, yy, xx, indexing='ij')
-            sphere = (ZZ ** 2 + YY ** 2 + XX ** 2) <= r2
-            result[z0:z1, y0:y1, x0:x1] |= sphere
-
-        return result
-
     # ── CT Vesselness ─────────────────────────────────────────────────────────
 
     def _ct_vesselness_mask(self, ct_node, sigma_min_mm, sigma_max_mm, threshold):

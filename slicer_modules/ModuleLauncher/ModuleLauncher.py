@@ -7,7 +7,7 @@ ModuleLauncher — 3D Slicer scripted module
 ==========================================
 
 Drag-and-drop this file into 3D Slicer, then find it under:
-    Modules → Utilities → Module Launcher
+    Modules → Metabolic Syndrome Toolkit → Module Launcher
 
 Opens any of your custom modules as an independent floating window so you
 can have multiple modules visible and usable at the same time.
@@ -104,12 +104,14 @@ class ModuleLauncher(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         self.parent.title        = "Module Launcher"
-        self.parent.categories   = ["Utilities"]
+        self.parent.categories   = ["Metabolic Syndrome Toolkit"]
         self.parent.dependencies = []
         self.parent.contributors = ["IshitaSinghFaujdar"]
         self.parent.helpText = (
             "Open any custom module as a floating window.\n"
-            "Multiple modules can be open and used simultaneously."
+            "Multiple modules can be open and used simultaneously.\n"
+            "Also runs the master batch pipeline (scripts/run_pipeline.py) "
+            "from a selected dataset folder."
         )
         self.parent.acknowledgementText = ""
 
@@ -119,8 +121,17 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
 
+        self.logic = ModuleLauncherLogic()
+        self._pipe_log_queue = []
+        self._pipe_log_lock = __import__("threading").Lock()
+        self._pipe_done_result = None  # (rc, err) when finished
+
         # Keep references so windows aren't garbage-collected when closed
         self._open_windows = {}   # import_name → list of open QWidget windows
+
+        self._pipe_poll = qt.QTimer()
+        self._pipe_poll.setInterval(250)
+        self._pipe_poll.connect('timeout()', self._poll_pipeline)
 
         # ── Header ────────────────────────────────────────────────────────────
         hdrLbl = qt.QLabel(
@@ -134,6 +145,9 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
         # ── Module buttons ────────────────────────────────────────────────────
         for cfg in _MODULES:
             self.layout.addWidget(self._make_module_card(cfg))
+
+        # ── Master pipeline (scripts/run_pipeline.py) ─────────────────────────
+        self._build_pipeline_panel()
 
         # ── Open windows list ─────────────────────────────────────────────────
         winBox = ctk.ctkCollapsibleButton()
@@ -155,6 +169,101 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
         winLayout.addWidget(closeAllBtn)
 
         self.layout.addStretch(1)
+
+    def _build_pipeline_panel(self):
+        pipeBox = ctk.ctkCollapsibleButton()
+        pipeBox.text = "Run Pipeline (batch CLI)"
+        pipeBox.collapsed = False
+        self.layout.addWidget(pipeBox)
+        form = qt.QFormLayout(pipeBox)
+
+        info = qt.QLabel(
+            "Runs scripts/run_pipeline.py: optional organize → generate_segments → "
+            "postprocessing → quantification. Select a dataset root folder and output Excel.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#455a64; font-size:11px; padding:4px;")
+        form.addRow(info)
+
+        self.pipeRootEdit = ctk.ctkPathLineEdit()
+        self.pipeRootEdit.filters = ctk.ctkPathLineEdit.Dirs
+        self.pipeRootEdit.setToolTip(
+            "Dataset root with CT/ PET/ Segments/ (or destination after organize).")
+        form.addRow("Root folder:", self.pipeRootEdit)
+
+        self.pipeSrcEdit = ctk.ctkPathLineEdit()
+        self.pipeSrcEdit.filters = ctk.ctkPathLineEdit.Dirs
+        self.pipeSrcEdit.setToolTip(
+            "Optional Stage 0: inbound raw DICOM / *__Studies folder to organize into Root.")
+        form.addRow("Organize from (optional):", self.pipeSrcEdit)
+
+        self.pipeOutEdit = ctk.ctkPathLineEdit()
+        self.pipeOutEdit.filters = ctk.ctkPathLineEdit.Files
+        self.pipeOutEdit.nameFilters = ["Excel (*.xlsx)", "All files (*)"]
+        self.pipeOutEdit.setToolTip("Quantification Excel output path.")
+        form.addRow("Output Excel:", self.pipeOutEdit)
+
+        self.pipeCkptEdit = ctk.ctkPathLineEdit()
+        self.pipeCkptEdit.filters = ctk.ctkPathLineEdit.Files
+        self.pipeCkptEdit.nameFilters = ["Checkpoint (*.ckpt *.pth)", "All files (*)"]
+        self.pipeCkptEdit.setToolTip("SegResNet VF checkpoint. Required unless Skip segmentation.")
+        default_ckpt = self.logic.default_vf_checkpoint()
+        if default_ckpt:
+            self.pipeCkptEdit.setCurrentPath(default_ckpt)
+        form.addRow("VF checkpoint:", self.pipeCkptEdit)
+
+        self.pipeDeviceEdit = qt.QLineEdit("gpu")
+        self.pipeDeviceEdit.setToolTip("'gpu', 'cpu', or device index like '0'.")
+        form.addRow("Device:", self.pipeDeviceEdit)
+
+        self.pipeLimitSpin = qt.QSpinBox()
+        self.pipeLimitSpin.setRange(0, 9999)
+        self.pipeLimitSpin.setValue(0)
+        self.pipeLimitSpin.setSpecialValueText("all")
+        self.pipeLimitSpin.setToolTip("Max subjects (0 = all).")
+        form.addRow("Limit subjects:", self.pipeLimitSpin)
+
+        stageRow = qt.QHBoxLayout()
+        self.pipeSkipSeg = qt.QCheckBox("Skip seg")
+        self.pipeSkipPost = qt.QCheckBox("Skip post")
+        self.pipeSkipQuant = qt.QCheckBox("Skip quant")
+        for w in (self.pipeSkipSeg, self.pipeSkipPost, self.pipeSkipQuant):
+            stageRow.addWidget(w)
+        stageRow.addStretch(1)
+        form.addRow("Stages:", stageRow)
+
+        optRow = qt.QHBoxLayout()
+        self.pipeRadiomics = qt.QCheckBox("Radiomics")
+        self.pipeNoSkipDone = qt.QCheckBox("Force re-run")
+        self.pipeNoAppend = qt.QCheckBox("Overwrite Excel")
+        self.pipeRadiomics.setToolTip("Pass --radiomics to quantification.")
+        self.pipeNoSkipDone.setToolTip("Pass --no-skip-done (recompute even if outputs exist).")
+        self.pipeNoAppend.setToolTip("Pass --no-append (overwrite Excel instead of appending).")
+        for w in (self.pipeRadiomics, self.pipeNoSkipDone, self.pipeNoAppend):
+            optRow.addWidget(w)
+        optRow.addStretch(1)
+        form.addRow("Options:", optRow)
+
+        self.pipeRunBtn = qt.QPushButton("Run Pipeline")
+        self.pipeRunBtn.setStyleSheet(
+            "QPushButton{background:#0d47a1;color:white;font-weight:bold;"
+            "padding:8px;border-radius:4px;}"
+            "QPushButton:hover{background:#1565c0;}"
+            "QPushButton:disabled{background:#90a4ae;}")
+        self.pipeRunBtn.clicked.connect(self._on_run_pipeline)
+        form.addRow("", self.pipeRunBtn)
+
+        self.pipeStatus = qt.QLabel("Idle.")
+        self.pipeStatus.setStyleSheet("color:#666; font-style:italic;")
+        form.addRow("Status:", self.pipeStatus)
+
+        self.pipeLog = qt.QPlainTextEdit()
+        self.pipeLog.setReadOnly(True)
+        self.pipeLog.setMaximumBlockCount(5000)
+        self.pipeLog.setFixedHeight(160)
+        self.pipeLog.setStyleSheet(
+            "QPlainTextEdit{font-family:Consolas,monospace;font-size:11px;"
+            "background:#263238;color:#eceff1;}")
+        form.addRow("Log:", self.pipeLog)
 
     # ── Card builder ──────────────────────────────────────────────────────────
 
@@ -256,6 +365,105 @@ class ModuleLauncherWidget(ScriptedLoadableModuleWidget):
                 self._on_window_closed(k, w))
 
         self._refresh_win_list()
+
+    # ── Master pipeline ───────────────────────────────────────────────────────
+
+    def _pipeline_opts_from_ui(self):
+        return {
+            "root": self.pipeRootEdit.currentPath,
+            "src": self.pipeSrcEdit.currentPath,
+            "out": self.pipeOutEdit.currentPath,
+            "ckpt": self.pipeCkptEdit.currentPath,
+            "device": self.pipeDeviceEdit.text.strip(),
+            "limit": int(self.pipeLimitSpin.value),
+            "skip_seg": bool(self.pipeSkipSeg.checked),
+            "skip_post": bool(self.pipeSkipPost.checked),
+            "skip_quant": bool(self.pipeSkipQuant.checked),
+            "radiomics": bool(self.pipeRadiomics.checked),
+            "no_skip_done": bool(self.pipeNoSkipDone.checked),
+            "no_append": bool(self.pipeNoAppend.checked),
+        }
+
+    def _on_run_pipeline(self):
+        import os
+
+        opts = self._pipeline_opts_from_ui()
+        root = (opts["root"] or "").strip()
+        out = (opts["out"] or "").strip()
+
+        if not root or not os.path.isdir(root):
+            slicer.util.errorDisplay(
+                "Select a valid Root folder (dataset with CT/ PET/ Segments/).",
+                windowTitle="Run Pipeline")
+            return
+        if not out:
+            slicer.util.errorDisplay(
+                "Select an Output Excel path (.xlsx).",
+                windowTitle="Run Pipeline")
+            return
+        if not opts["skip_seg"]:
+            ckpt = (opts["ckpt"] or "").strip()
+            if not ckpt or not os.path.isfile(ckpt):
+                slicer.util.errorDisplay(
+                    "VF checkpoint file not found. Pick a .ckpt or check Skip seg.",
+                    windowTitle="Run Pipeline")
+                return
+        src = (opts["src"] or "").strip()
+        if src and not os.path.isdir(src):
+            slicer.util.errorDisplay(
+                "Organize-from path is set but is not a valid folder.",
+                windowTitle="Run Pipeline")
+            return
+
+        self.pipeLog.clear()
+        self._pipe_log_queue = []
+        self._pipe_done_result = None
+        self.pipeStatus.setText("Running…")
+        self.pipeStatus.setStyleSheet("color:#0d47a1; font-weight:bold;")
+        self.pipeRunBtn.setEnabled(False)
+
+        def _log(msg):
+            with self._pipe_log_lock:
+                self._pipe_log_queue.append(str(msg))
+
+        def _done(rc, err):
+            self._pipe_done_result = (rc, err)
+
+        ok = self.logic.run_pipeline_async(opts, log_cb=_log, done_cb=_done)
+        if not ok:
+            self.pipeRunBtn.setEnabled(True)
+            self.pipeStatus.setText("Already running.")
+            slicer.util.warningDisplay(
+                "A pipeline run is already in progress.",
+                windowTitle="Run Pipeline")
+            return
+        self._pipe_poll.start()
+
+    def _poll_pipeline(self):
+        with self._pipe_log_lock:
+            batch = self._pipe_log_queue
+            self._pipe_log_queue = []
+        for line in batch:
+            self.pipeLog.appendPlainText(line)
+        done = self._pipe_done_result
+        if done is None:
+            return
+        self._pipe_done_result = None
+        self._pipe_poll.stop()
+        rc, err = done
+        self.pipeRunBtn.setEnabled(True)
+        if err:
+            self.pipeStatus.setText(f"Failed (exception). exit={rc}")
+            self.pipeStatus.setStyleSheet("color:#b71c1c; font-weight:bold;")
+            slicer.util.errorDisplay(
+                f"Pipeline failed:\n{err}",
+                windowTitle="Run Pipeline")
+        elif rc == 0:
+            self.pipeStatus.setText("Finished OK.")
+            self.pipeStatus.setStyleSheet("color:#1b5e20; font-weight:bold;")
+        else:
+            self.pipeStatus.setText(f"Finished with errors (exit={rc}).")
+            self.pipeStatus.setStyleSheet("color:#e65100; font-weight:bold;")
 
     # ── Window tracking ───────────────────────────────────────────────────────
 
